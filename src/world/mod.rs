@@ -1,9 +1,13 @@
+pub mod camera;
 pub mod objects;
+pub mod road_segments;
 pub mod speed;
 
 use std::collections::VecDeque;
 
+use self::camera::Camera;
 use self::objects::RoadsideObject;
+use self::road_segments::RoadSegment;
 use self::speed::VelocityTier;
 use crate::git::seed::RepoSeed;
 use crate::git::PollResult;
@@ -11,6 +15,7 @@ use crate::git::PollResult;
 pub struct WorldState {
     pub z_offset: f32,
     pub camera_z: f32,
+    pub camera: Camera,
     pub speed: f32,
     pub speed_target: f32,
     pub commits_per_min: f32,
@@ -31,20 +36,36 @@ pub struct WorldState {
     pub speed_hold_time: f32,
     /// How long Left/Right has been held continuously (for exponential ramp)
     pub curve_hold_time: f32,
+    // --- 6-gear transmission ---
+    /// Current gear (0-based: 0=1st, 5=6th)
+    pub gear: u8,
+    /// Engine RPM
+    pub rpm: f32,
+    /// Throttle position 0.0–1.0 (derived from git activity + idle)
+    pub throttle: f32,
+    /// Remaining shift cooldown (brief power dip during gear change)
+    pub shift_cooldown: f32,
+    /// True during the frame a shift occurred (for HUD flash)
+    pub just_shifted: bool,
+    /// Road segments ahead of the camera for hills and per-segment curvature.
+    pub segments: Vec<RoadSegment>,
+    /// World-Z of the first segment's start.
+    pub segment_z_start: f32,
 }
 
-const SPAWN_DISTANCE: f32 = 100.0;
-const NEAR_SPAWN: f32 = 30.0;
-const DRAW_DISTANCE: f32 = 200.0;
-const DESPAWN_BEHIND: f32 = 5.0;
+const SPAWN_DISTANCE: f32 = 2500.0;
+const NEAR_SPAWN: f32 = 750.0;
+const DRAW_DISTANCE: f32 = 5000.0;
+const DESPAWN_BEHIND: f32 = 125.0;
 
 impl WorldState {
     pub fn new(seed: &RepoSeed) -> Self {
         Self {
             z_offset: 0.0,
             camera_z: 0.0,
-            speed: 30.0,
-            speed_target: 30.0 + seed.speed_base * 210.0,
+            camera: Camera::new(),
+            speed: 10.0,
+            speed_target: 10.0 + seed.speed_base * 70.0,
             commits_per_min: 0.0,
             lines_added: 0,
             lines_deleted: 0,
@@ -61,20 +82,96 @@ impl WorldState {
             curve_multiplier: 1.0,
             speed_hold_time: 0.0,
             curve_hold_time: 0.0,
+            gear: 0,
+            rpm: speed::RPM_IDLE,
+            throttle: 0.0,
+            shift_cooldown: 0.0,
+            just_shifted: false,
+            segments: {
+                let mut segs = Vec::with_capacity(road_segments::SEGMENT_COUNT);
+                for i in 0..road_segments::SEGMENT_COUNT {
+                    let z = i as f32 * road_segments::SEGMENT_LENGTH;
+                    segs.push(road_segments::generate_segment(z, 0.0, 0.0));
+                }
+                segs
+            },
+            segment_z_start: 0.0,
         }
     }
 
     pub fn update(&mut self, dt: f32) {
         self.time += dt;
+        self.just_shifted = false;
 
-        // Lerp speed toward target (with user multiplier)
-        let effective_target = self.speed_target * self.speed_multiplier;
-        self.speed += (effective_target - self.speed) * 4.0 * dt;
+        // --- Throttle: git activity drives throttle, with a base idle ---
+        // Idle cruise: 0.15 throttle so the car always moves
+        // Full throttle at ~4 cpm (VelocityDemon)
+        let activity_throttle = (self.commits_per_min / 4.0).clamp(0.0, 1.0);
+        let target_throttle = 0.15 + activity_throttle * 0.85;
+        self.throttle += (target_throttle - self.throttle) * 3.0 * dt;
+
+        // --- Shift cooldown ---
+        if self.shift_cooldown > 0.0 {
+            self.shift_cooldown = (self.shift_cooldown - dt).max(0.0);
+        }
+
+        // --- Engine RPM + gear-based acceleration ---
+        let effective_throttle = if self.shift_cooldown > 0.0 {
+            self.throttle * 0.2 // power dip during shift
+        } else {
+            self.throttle
+        };
+
+        let torque = speed::torque_at_rpm(self.rpm) * effective_throttle;
+        let gear_ratio = speed::GEAR_RATIOS[self.gear as usize];
+        // Acceleration: torque × gear_ratio, scaled by multiplier
+        let accel = torque * gear_ratio * 120.0 * self.speed_multiplier;
+        // Engine braking when off throttle
+        let drag = self.speed * 0.3;
+        self.speed = (self.speed + (accel - drag) * dt).max(0.0);
+
+        // Update RPM from road speed
+        self.rpm = speed::speed_to_rpm(self.speed, self.gear);
+
+        // --- Auto-shift logic ---
+        if self.shift_cooldown <= 0.0 {
+            if self.rpm >= speed::RPM_UPSHIFT && self.gear < speed::GEAR_COUNT - 1 {
+                self.gear += 1;
+                self.rpm = speed::speed_to_rpm(self.speed, self.gear);
+                self.shift_cooldown = speed::SHIFT_COOLDOWN;
+                self.just_shifted = true;
+            } else if self.rpm <= speed::RPM_DOWNSHIFT && self.gear > 0 {
+                self.gear -= 1;
+                self.rpm = speed::speed_to_rpm(self.speed, self.gear);
+                self.shift_cooldown = speed::SHIFT_COOLDOWN;
+                self.just_shifted = true;
+            }
+        }
+
         self.z_offset += self.speed * dt;
         self.camera_z += self.speed * dt;
+        // Sync camera with world state (camera_z is the source of truth during migration)
+        self.camera.z = self.camera_z;
+        self.camera.sync(self.speed, self.tier);
+
+        // Recycle road segments: drop those behind camera, append new at far end
+        while !self.segments.is_empty()
+            && self.segment_z_start + road_segments::SEGMENT_LENGTH < self.camera_z
+        {
+            self.segments.remove(0);
+            self.segment_z_start += road_segments::SEGMENT_LENGTH;
+        }
+        while self.segments.len() < road_segments::SEGMENT_COUNT {
+            let z =
+                self.segment_z_start + self.segments.len() as f32 * road_segments::SEGMENT_LENGTH;
+            self.segments.push(road_segments::generate_segment(
+                z,
+                self.commits_per_min,
+                self.time,
+            ));
+        }
 
         // Auto-steering: gentle sinusoidal weave for visual interest
-        // Two overlapping sine waves at different frequencies for organic feel
         let base_steer = (self.time * 0.3).sin() * 40.0
             + (self.time * 0.13).sin() * 25.0
             + (self.time * 0.07).sin() * 15.0;
@@ -84,7 +181,7 @@ impl WorldState {
         let curve_target = self.curve_target * self.curve_multiplier;
         self.curve_offset += (curve_target + self.steer_angle - self.curve_offset) * 2.5 * dt;
 
-        // Update tier
+        // Update tier + legacy speed_target (used by draw_distance etc.)
         self.tier = VelocityTier::from_commits_per_min(self.commits_per_min);
         self.speed_target = speed::speed_target(self.commits_per_min);
 
@@ -235,8 +332,8 @@ mod tests {
         let w = WorldState::new(&seed);
         assert_eq!(w.z_offset, 0.0);
         assert_eq!(w.camera_z, 0.0);
-        assert!((w.speed - 30.0).abs() < 0.001);
-        assert!((w.speed_target - (30.0 + 0.5 * 210.0)).abs() < 0.001);
+        assert!((w.speed - 10.0).abs() < 0.001);
+        assert!((w.speed_target - (10.0 + 0.5 * 70.0)).abs() < 0.001);
         assert_eq!(w.commits_per_min, 0.0);
         assert_eq!(w.tier, VelocityTier::Flatline);
         assert_eq!(w.total_commits, 250);
@@ -251,13 +348,13 @@ mod tests {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         // Set cpm so speed_target remains high after recomputation
-        // speed_target(2.0) = 30.0 + 420.0 = 450.0
+        // speed_target(2.0) = 10.0 + 140.0 = 150.0
         w.commits_per_min = 2.0;
         w.speed = 1.0;
         let old_speed = w.speed;
         w.update(0.1);
         assert!(w.speed > old_speed, "speed should increase toward target");
-        assert!(w.speed < 450.0, "speed should not overshoot target");
+        assert!(w.speed < 150.0, "speed should not overshoot target");
     }
 
     #[test]
@@ -298,7 +395,7 @@ mod tests {
         // Place an object behind camera
         w.active_objects.push((
             objects::Lane::Left,
-            -10.0, // well behind camera_z=0
+            -200.0, // well behind camera_z=0
             RoadsideObject::VelocitySign {
                 commits_per_min: 1.0,
             },
@@ -525,7 +622,7 @@ mod tests {
     fn test_draw_distance_normal() {
         let seed = test_seed();
         let w = WorldState::new(&seed);
-        assert!((w.draw_distance() - 200.0).abs() < 0.1);
+        assert!((w.draw_distance() - 5000.0).abs() < 0.1);
     }
 
     #[test]
@@ -533,7 +630,7 @@ mod tests {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         w.tier = VelocityTier::VelocityDemon;
-        assert!((w.draw_distance() - 240.0).abs() < 0.1);
+        assert!((w.draw_distance() - 6000.0).abs() < 0.1);
     }
 
     // --- sector ---

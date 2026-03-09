@@ -3,6 +3,7 @@ pub mod font;
 pub mod hud;
 pub mod menu;
 pub mod road;
+pub mod road_table;
 pub mod sky;
 pub mod sprites;
 pub mod terrain;
@@ -17,6 +18,7 @@ pub struct PassTimings {
     pub sky_us: u128,
     pub terrain_us: u128,
     pub road_us: u128,
+    pub road_table_us: u128,
     pub sprites_us: u128,
     pub effects_us: u128,
     pub blur_us: u128,
@@ -105,33 +107,45 @@ impl FrameRenderer {
         let render_start = Instant::now();
         self.frame_count += 1;
         let (w, h) = (self.pixel_w, self.pixel_h);
-        let horizon_y = (h as f32 * road::horizon_ratio(world)) as u32;
+        let horizon_y = world.camera.horizon_y(h);
+
+        // 0. Build road table (per-row curve/slope offsets)
+        let t = Instant::now();
+        let rtable = road_table::build_road_table(
+            &world.camera,
+            &world.segments,
+            world.camera_z,
+            world.segment_z_start,
+            h,
+            horizon_y,
+        );
+        self.pass_timings.road_table_us = t.elapsed().as_micros();
 
         // 1-2. Sky + sun + bloom bleed
         let t = Instant::now();
         sky::draw_sky(&mut self.fb, w, h, horizon_y, seed, world);
+        sky::draw_stars(&mut self.fb, w, horizon_y, world);
         sky::draw_sun(&mut self.fb, w, horizon_y, seed, world);
         sky::draw_bloom_bleed(&mut self.fb, w, horizon_y, seed, world);
         self.pass_timings.sky_us = t.elapsed().as_micros();
 
-        // 3-4. Terrain
+        // 3. Ocean surface
         let t = Instant::now();
-        terrain::draw_terrain(&mut self.fb, w, h, horizon_y, seed, world);
+        road::draw_road(&mut self.fb, w, h, horizon_y, world, seed, &rtable);
+        self.pass_timings.road_us = t.elapsed().as_micros();
+
+        // 4. Islands + clouds (on top of ocean, under grid)
+        let t = Instant::now();
+        terrain::draw_terrain(&mut self.fb, w, h, horizon_y, seed, world, &rtable);
         self.pass_timings.terrain_us = t.elapsed().as_micros();
 
-        // 5-6. Road scanlines + grid
-        let t = Instant::now();
-        road::draw_road(&mut self.fb, w, h, horizon_y, world, seed);
-        road::draw_grid(&mut self.fb, w, h, horizon_y, world, seed);
-        self.pass_timings.road_us = t.elapsed().as_micros();
+        // 5. Perspective grid (transparent, on top of everything)
+        road::draw_grid(&mut self.fb, w, h, horizon_y, world, seed, &rtable);
 
         // 7. Sprites + player car + speed lines
         let t = Instant::now();
-        sprites::draw_sprites(&mut self.fb, w, h, horizon_y, world, seed);
+        sprites::draw_sprites(&mut self.fb, w, h, horizon_y, world, seed, &rtable);
         effects::draw_car(&mut self.fb, w, h, world);
-        if world.tier_index() >= 3 {
-            effects::draw_speed_lines(&mut self.fb, w, horizon_y, world, seed);
-        }
         self.pass_timings.sprites_us = t.elapsed().as_micros();
 
         // 8. Motion blur

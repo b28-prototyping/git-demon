@@ -1,29 +1,22 @@
 use image::{ImageBuffer, Rgba};
 
+use super::road_table::RoadRow;
 use crate::git::seed::RepoSeed;
 use crate::world::speed::VelocityTier;
 use crate::world::WorldState;
 
-const BASE_HORIZON_RATIO: f32 = 0.35;
-const ROAD_MIN_HALF: f32 = 8.0;
+const BASE_HORIZON_RATIO: f32 = 0.25;
 const ROAD_MAX_HALF: f32 = 480.0;
-const RUMBLE_WIDTH: u32 = 12;
-const PERSPECTIVE_SCALE: f32 = 10.0;
-const STRIPE_PERIOD: f32 = 6.0;
-
-const STRIPE_LIGHT: Rgba<u8> = Rgba([90, 90, 90, 255]);
-const STRIPE_DARK: Rgba<u8> = Rgba([70, 70, 70, 255]);
-const VERGE_A: Rgba<u8> = Rgba([15, 40, 15, 255]);
-const VERGE_B: Rgba<u8> = Rgba([10, 30, 10, 255]);
-const RUMBLE_WHITE: Rgba<u8> = Rgba([200, 200, 200, 255]);
-const RUMBLE_RED: Rgba<u8> = Rgba([180, 30, 30, 255]);
 
 pub fn horizon_ratio(world: &WorldState) -> f32 {
-    if world.tier == VelocityTier::VelocityDemon {
+    let base = if world.tier == VelocityTier::VelocityDemon {
         BASE_HORIZON_RATIO + 0.02
     } else {
         BASE_HORIZON_RATIO
-    }
+    };
+    // Sprint FOV: horizon drops at high speed for a sense of velocity.
+    let speed_t = (world.speed / 300.0).clamp(0.0, 1.0);
+    base - speed_t * 0.06
 }
 
 pub fn road_max_half(world: &WorldState) -> f32 {
@@ -34,10 +27,9 @@ pub fn road_max_half(world: &WorldState) -> f32 {
     }
 }
 
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
+/// Fill below horizon with ocean surface.
+/// The ocean is a flat background fill — hill slope offsets are applied
+/// only to grid lines and objects, not to the base ocean gradient.
 pub fn draw_road(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     w: u32,
@@ -45,60 +37,38 @@ pub fn draw_road(
     horizon_y: u32,
     world: &WorldState,
     _seed: &RepoSeed,
+    _road_table: &[RoadRow],
 ) {
-    let max_half = road_max_half(world);
-    let cx_base = w as f32 / 2.0;
-    let road_rows = (h - horizon_y).max(1) as f32;
     let raw = fb.as_mut();
     let stride = w as usize * 4;
+    let road_rows = (h - horizon_y).max(1) as f32;
+
+    // One wave value per row (cheap) instead of per pixel
+    let z_phase = world.z_offset * 0.05;
 
     for y in horizon_y..h {
         let depth = (y - horizon_y) as f32 / road_rows;
-
-        let curve_shift = world.curve_offset * depth * depth;
-        let cx = cx_base + curve_shift;
-
-        let road_half = lerp(ROAD_MIN_HALF, max_half, depth);
-        let road_l = (cx - road_half).max(0.0) as u32;
-        let road_r = ((cx + road_half) as u32).min(w - 1);
-
-        // Perspective projection: SCALE/depth gives world-Z for this scanline,
-        // z_offset scrolls uniformly so stripes appear/disappear at equal rates.
-        // Scale period with speed to prevent wagon-wheel aliasing at high multipliers.
-        let period = STRIPE_PERIOD * (1.0 + world.speed * 0.05);
-        let world_z = PERSPECTIVE_SCALE / depth.max(0.01) + world.z_offset;
-        let stripe = (world_z % (period * 2.0)) < period;
-
-        let road_color = if stripe { STRIPE_LIGHT } else { STRIPE_DARK };
-        let verge_color = if stripe { VERGE_A } else { VERGE_B };
-        let rumble_color = if stripe { RUMBLE_WHITE } else { RUMBLE_RED };
+        // Per-row wave shimmer — single sin per scanline
+        let wave = ((y as f32 * 0.3 + z_phase).sin() * 3.0) as i16;
+        // Ocean gradient: dark deep blue near horizon, lighter near camera
+        let r = ((2.0 + depth * 8.0) as i16 + wave).clamp(0, 255) as u8;
+        let g = ((8.0 + depth * 25.0) as i16 + wave).clamp(0, 255) as u8;
+        let b = ((25.0 + depth * 55.0) as i16 + wave * 2).clamp(0, 255) as u8;
 
         let row_offset = y as usize * stride;
-        let rumble_l = road_l.saturating_sub(RUMBLE_WIDTH);
-
         for x in 0..w {
-            let color = if x < rumble_l {
-                verge_color
-            } else if x < road_l {
-                rumble_color
-            } else if x <= road_r {
-                road_color
-            } else if x <= road_r + RUMBLE_WIDTH {
-                rumble_color
-            } else {
-                verge_color
-            };
             let off = row_offset + x as usize * 4;
             if off + 3 < raw.len() {
-                raw[off] = color.0[0];
-                raw[off + 1] = color.0[1];
-                raw[off + 2] = color.0[2];
+                raw[off] = r;
+                raw[off + 1] = g;
+                raw[off + 2] = b;
                 raw[off + 3] = 255;
             }
         }
     }
 }
 
+/// Perspective grid lines on the void floor (Tron-style).
 pub fn draw_grid(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     w: u32,
@@ -106,44 +76,47 @@ pub fn draw_grid(
     horizon_y: u32,
     world: &WorldState,
     seed: &RepoSeed,
+    road_table: &[RoadRow],
 ) {
-    let max_half = road_max_half(world);
     let cx_base = w as f32 / 2.0;
     let accent = hue_to_neon(seed.accent_hue);
+    let cam = &world.camera;
+    let raw = fb.as_mut();
+    let stride = w as usize * 4;
 
-    // Horizontal grid lines at regular world-Z intervals, scrolling with camera
-    let grid_spacing = 5.0_f32;
+    // --- Horizontal grid lines at regular world-Z intervals ---
+    let grid_spacing = 125.0_f32;
     let camera_offset = world.camera_z % grid_spacing;
-    for i in 1..40 {
-        let z_world = i as f32 * grid_spacing - camera_offset;
-        if z_world <= 0.0 {
+    for i in 1..80 {
+        let z_rel = i as f32 * grid_spacing - camera_offset;
+        if z_rel <= 0.0 {
             continue;
         }
-        let depth_scale = (1.0 - z_world / world.draw_distance()).clamp(0.0, 1.0);
-        if depth_scale < 0.02 {
+        let z_world = world.camera_z + z_rel;
+        let Some((sy, depth_scale)) = cam.project(z_world, h, horizon_y) else {
+            continue;
+        };
+        if depth_scale < 0.005 {
             continue;
         }
 
-        let y = lerp(horizon_y as f32, h as f32, depth_scale) as u32;
-        if y >= h || y < horizon_y {
+        // Apply slope offset from road table
+        let row_idx = (sy as u32).saturating_sub(horizon_y) as usize;
+        let slope_off = road_table
+            .get(row_idx)
+            .map(|r| r.slope_offset)
+            .unwrap_or(0.0);
+        let dest_y = (sy + slope_off) as i32;
+        if dest_y < horizon_y as i32 || dest_y >= h as i32 {
             continue;
         }
+        let y = dest_y as u32;
 
-        let depth = (y - horizon_y) as f32 / (h - horizon_y).max(1) as f32;
-        let curve_shift = world.curve_offset * depth * depth;
-        let cx = cx_base + curve_shift;
-
-        let road_half = lerp(ROAD_MIN_HALF, max_half, depth_scale);
-        let road_l = (cx - road_half).max(0.0) as u32;
-        let road_r = ((cx + road_half) as u32).min(w - 1);
-
-        let fg_a = 150u32;
+        let fg_a = (depth_scale * 70.0) as u32;
         let inv_a = 255 - fg_a;
-        let raw = fb.as_mut();
-        let stride = w as usize * 4;
         let row_off = y as usize * stride;
 
-        for x in road_l..=road_r {
+        for x in 0..w {
             let off = row_off + x as usize * 4;
             if off + 3 < raw.len() {
                 raw[off] = ((accent.0[0] as u32 * fg_a + raw[off] as u32 * inv_a) / 255) as u8;
@@ -151,6 +124,50 @@ pub fn draw_grid(
                     ((accent.0[1] as u32 * fg_a + raw[off + 1] as u32 * inv_a) / 255) as u8;
                 raw[off + 2] =
                     ((accent.0[2] as u32 * fg_a + raw[off + 2] as u32 * inv_a) / 255) as u8;
+            }
+        }
+    }
+
+    // --- Vertical grid lines converging to vanishing point ---
+    // Use per-row curve offsets from road table for segment-aware curvature.
+    let road_rows = (h - horizon_y).max(1) as f32;
+    let num_vert = 24i32;
+    let half_n = num_vert / 2;
+
+    for i in 0..num_vert {
+        let lane = (i as f32 - half_n as f32 + 0.5) / half_n as f32;
+
+        for y in (horizon_y + 1)..h {
+            let row_idx = (y - horizon_y) as usize;
+            let (depth_scale, curve_shift, slope_off) = if let Some(row) = road_table.get(row_idx) {
+                (
+                    row.depth_scale,
+                    row.curve_offset * row.depth_scale * row.depth_scale,
+                    row.slope_offset,
+                )
+            } else {
+                let ds = (y - horizon_y) as f32 / road_rows;
+                (ds, world.curve_offset * ds * ds, 0.0)
+            };
+            let dest_y = (y as f32 + slope_off) as i32;
+            if dest_y < horizon_y as i32 || dest_y >= h as i32 {
+                continue;
+            }
+            let cx = cx_base + curve_shift;
+            let spread = cam.road_half(depth_scale) * 1.5;
+            let x = (cx + lane * spread) as i32;
+
+            if x >= 0 && (x as u32) < w {
+                let fg_a = (depth_scale * 30.0) as u32;
+                let inv_a = 255 - fg_a;
+                let off = dest_y as usize * stride + x as usize * 4;
+                if off + 3 < raw.len() {
+                    raw[off] = ((accent.0[0] as u32 * fg_a + raw[off] as u32 * inv_a) / 255) as u8;
+                    raw[off + 1] =
+                        ((accent.0[1] as u32 * fg_a + raw[off + 1] as u32 * inv_a) / 255) as u8;
+                    raw[off + 2] =
+                        ((accent.0[2] as u32 * fg_a + raw[off + 2] as u32 * inv_a) / 255) as u8;
+                }
             }
         }
     }
@@ -182,21 +199,13 @@ fn hsl_to_rgb_inline(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 }
 
 #[cfg(test)]
-fn blend_alpha(bg: Rgba<u8>, fg: Rgba<u8>) -> Rgba<u8> {
-    let a = fg.0[3] as f32 / 255.0;
-    let inv_a = 1.0 - a;
-    Rgba([
-        (fg.0[0] as f32 * a + bg.0[0] as f32 * inv_a) as u8,
-        (fg.0[1] as f32 * a + bg.0[1] as f32 * inv_a) as u8,
-        (fg.0[2] as f32 * a + bg.0[2] as f32 * inv_a) as u8,
-        255,
-    ])
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        a + (b - a) * t
+    }
 
     fn test_seed() -> RepoSeed {
         RepoSeed {
@@ -214,8 +223,10 @@ mod tests {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         w.tier = tier;
+        w.speed = 0.0;
         w.z_offset = 10.0;
         w.curve_offset = 0.0;
+        w.camera.sync(w.speed, w.tier);
         w
     }
 
@@ -237,58 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn test_horizon_ratio_normal() {
+    fn test_camera_horizon_ratio_normal() {
         let world = test_world(VelocityTier::Cruise);
-        assert!((horizon_ratio(&world) - 0.35).abs() < 1e-6);
+        assert!((world.camera.horizon_ratio - 0.25).abs() < 1e-6);
     }
 
     #[test]
-    fn test_horizon_ratio_velocity_demon() {
+    fn test_camera_horizon_ratio_velocity_demon() {
         let world = test_world(VelocityTier::VelocityDemon);
-        assert!((horizon_ratio(&world) - 0.37).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_road_max_half_normal() {
-        let world = test_world(VelocityTier::Cruise);
-        assert!((road_max_half(&world) - 480.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_road_max_half_velocity_demon() {
-        let world = test_world(VelocityTier::VelocityDemon);
-        assert!((road_max_half(&world) - 504.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_blend_alpha_opaque() {
-        let bg = Rgba([100, 100, 100, 255]);
-        let fg = Rgba([200, 50, 50, 255]);
-        let result = blend_alpha(bg, fg);
-        assert_eq!(result.0[0], 200);
-        assert_eq!(result.0[1], 50);
-        assert_eq!(result.0[2], 50);
-    }
-
-    #[test]
-    fn test_blend_alpha_transparent() {
-        let bg = Rgba([100, 100, 100, 255]);
-        let fg = Rgba([200, 50, 50, 0]);
-        let result = blend_alpha(bg, fg);
-        assert_eq!(result.0[0], 100);
-        assert_eq!(result.0[1], 100);
-        assert_eq!(result.0[2], 100);
-    }
-
-    #[test]
-    fn test_blend_alpha_half() {
-        let bg = Rgba([0, 0, 0, 255]);
-        let fg = Rgba([200, 100, 50, 128]);
-        let result = blend_alpha(bg, fg);
-        // alpha ≈ 0.502, so result ≈ fg * 0.502
-        assert!((result.0[0] as i32 - 100).abs() <= 2);
-        assert!((result.0[1] as i32 - 50).abs() <= 2);
-        assert!((result.0[2] as i32 - 25).abs() <= 2);
+        assert!((world.camera.horizon_ratio - 0.27).abs() < 1e-6);
     }
 
     #[test]
@@ -313,152 +281,70 @@ mod tests {
         assert_eq!(c.0[3], 255);
     }
 
-    // --- Rendering invariant tests ---
+    // --- Void floor tests ---
 
     #[test]
-    fn test_draw_road_perspective_width() {
+    fn test_draw_road_fills_below_horizon() {
         let (w, h) = (200, 200);
         let mut fb = ImageBuffer::new(w, h);
         let world = test_world(VelocityTier::Cruise);
         let seed = test_seed();
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+        let horizon_y = world.camera.horizon_y(h);
 
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
+        draw_road(&mut fb, w, h, horizon_y, &world, &seed, &[]);
 
-        // Count road pixels (non-verge) near horizon vs near bottom
-        let count_road = |y: u32| -> u32 {
-            (0..w)
-                .filter(|&x| {
-                    let p = fb.get_pixel(x, y);
-                    *p != VERGE_A && *p != VERGE_B
-                })
-                .count() as u32
-        };
-
-        let near_horizon = count_road(horizon_y + 2);
-        let near_bottom = count_road(h - 1);
-        assert!(
-            near_bottom > near_horizon,
-            "Road should be wider at bottom ({near_bottom}) than near horizon ({near_horizon})"
-        );
+        for y in horizon_y..h {
+            for x in 0..w {
+                let p = fb.get_pixel(x, y);
+                assert_eq!(p.0[3], 255, "Void pixel at ({x},{y}) should be opaque");
+                assert!(
+                    p.0[0] > 0 || p.0[1] > 0 || p.0[2] > 0,
+                    "Void pixel at ({x},{y}) should have some brightness"
+                );
+            }
+        }
     }
 
     #[test]
-    fn test_draw_road_stripe_colors_present() {
+    fn test_draw_road_void_gradient() {
         let (w, h) = (200, 200);
         let mut fb = ImageBuffer::new(w, h);
-        let mut world = test_world(VelocityTier::Cruise);
-        world.z_offset = 5.0; // Ensure both stripe phases are hit across scanlines
+        let world = test_world(VelocityTier::Cruise);
         let seed = test_seed();
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+        let horizon_y = world.camera.horizon_y(h);
 
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
+        draw_road(&mut fb, w, h, horizon_y, &world, &seed, &[]);
 
-        let has_light = fb.pixels().any(|p| *p == STRIPE_LIGHT);
-        let has_dark = fb.pixels().any(|p| *p == STRIPE_DARK);
-        assert!(has_light, "STRIPE_LIGHT should appear");
-        assert!(has_dark, "STRIPE_DARK should appear");
-    }
-
-    #[test]
-    fn test_draw_road_rumble_colors_present() {
-        let (w, h) = (400, 200);
-        let mut fb = ImageBuffer::new(w, h);
-        let mut world = test_world(VelocityTier::Cruise);
-        world.z_offset = 5.0;
-        let seed = test_seed();
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
-
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
-
-        let has_white = fb.pixels().any(|p| *p == RUMBLE_WHITE);
-        let has_red = fb.pixels().any(|p| *p == RUMBLE_RED);
-        assert!(has_white, "RUMBLE_WHITE should appear");
-        assert!(has_red, "RUMBLE_RED should appear");
-    }
-
-    #[test]
-    fn test_draw_road_verge_colors_present() {
-        let (w, h) = (400, 200);
-        let mut fb = ImageBuffer::new(w, h);
-        let mut world = test_world(VelocityTier::Cruise);
-        world.z_offset = 5.0;
-        let seed = test_seed();
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
-
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
-
-        let has_a = fb.pixels().any(|p| *p == VERGE_A);
-        let has_b = fb.pixels().any(|p| *p == VERGE_B);
-        assert!(has_a, "VERGE_A should appear");
-        assert!(has_b, "VERGE_B should appear");
-    }
-
-    #[test]
-    fn test_draw_road_curve_shifts_center() {
-        // Buffer must be wider than 2 * ROAD_MAX_HALF (960) so road doesn't fill entire row
-        let (w, h) = (1200, 200);
-        let seed = test_seed();
-
-        // Render with no curve
-        let mut fb_straight = ImageBuffer::new(w, h);
-        let mut world_straight = test_world(VelocityTier::Cruise);
-        world_straight.curve_offset = 0.0;
-        let horizon_y = (h as f32 * horizon_ratio(&world_straight)) as u32;
-        draw_road(&mut fb_straight, w, h, horizon_y, &world_straight, &seed);
-
-        // Render with positive curve
-        let mut fb_curved = ImageBuffer::new(w, h);
-        let mut world_curved = test_world(VelocityTier::Cruise);
-        world_curved.curve_offset = 50.0;
-        draw_road(&mut fb_curved, w, h, horizon_y, &world_curved, &seed);
-
-        // Find road center at bottom row (midpoint of non-verge pixels)
-        let bottom_y = h - 1;
-        let road_center = |fb: &ImageBuffer<Rgba<u8>, Vec<u8>>| -> f32 {
-            let road_pixels: Vec<u32> = (0..w)
-                .filter(|&x| {
-                    let p = fb.get_pixel(x, bottom_y);
-                    *p != VERGE_A && *p != VERGE_B
-                })
-                .collect();
-            if road_pixels.is_empty() {
-                return w as f32 / 2.0;
-            }
-            (road_pixels[0] + road_pixels[road_pixels.len() - 1]) as f32 / 2.0
-        };
-
-        let center_straight = road_center(&fb_straight);
-        let center_curved = road_center(&fb_curved);
-        assert!(center_curved > center_straight, "Positive curve should shift road center right: straight={center_straight}, curved={center_curved}");
-    }
-
-    #[test]
-    fn test_draw_road_velocity_demon_wider() {
-        // Buffer must be wider than 2 * 504 (VelocityDemon max half) = 1008
-        let (w, h) = (1200, 200);
-        let seed = test_seed();
-
-        let count_road_at_bottom = |tier: VelocityTier| -> u32 {
-            let mut fb = ImageBuffer::new(w, h);
-            let world = test_world(tier);
-            let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
-            draw_road(&mut fb, w, h, horizon_y, &world, &seed);
-            let bottom_y = h - 1;
-            (0..w)
-                .filter(|&x| {
-                    let p = fb.get_pixel(x, bottom_y);
-                    *p != VERGE_A && *p != VERGE_B
-                })
-                .count() as u32
-        };
-
-        let normal_width = count_road_at_bottom(VelocityTier::Cruise);
-        let demon_width = count_road_at_bottom(VelocityTier::VelocityDemon);
+        let near = fb.get_pixel(w / 2, h - 1);
+        let far = fb.get_pixel(w / 2, horizon_y);
         assert!(
-            demon_width > normal_width,
-            "VelocityDemon road should be wider: normal={normal_width}, demon={demon_width}"
+            near.0[0] > far.0[0],
+            "Near void ({}) should be brighter than far void ({})",
+            near.0[0],
+            far.0[0]
         );
+    }
+
+    #[test]
+    fn test_draw_road_sky_untouched() {
+        let (w, h) = (200, 200);
+        let marker = Rgba([42, 42, 42, 255]);
+        let mut fb = ImageBuffer::from_pixel(w, h, marker);
+        let world = test_world(VelocityTier::Cruise);
+        let seed = test_seed();
+        let horizon_y = world.camera.horizon_y(h);
+
+        draw_road(&mut fb, w, h, horizon_y, &world, &seed, &[]);
+
+        for y in 0..horizon_y {
+            for x in 0..w {
+                assert_eq!(
+                    *fb.get_pixel(x, y),
+                    marker,
+                    "Sky pixel ({x},{y}) should be untouched"
+                );
+            }
+        }
     }
 
     #[test]
@@ -466,68 +352,36 @@ mod tests {
         let (w, h) = (100, 100);
         let mut fb = ImageBuffer::new(w, h);
         let seed = test_seed();
-
         let mut world = test_world(VelocityTier::Cruise);
         world.curve_offset = -80.0;
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
-        // If we get here without panic, the test passes
+        let horizon_y = world.camera.horizon_y(h);
+        draw_road(&mut fb, w, h, horizon_y, &world, &seed, &[]);
 
         world.curve_offset = 80.0;
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
-        // Same — no panic with extreme positive offset
+        draw_road(&mut fb, w, h, horizon_y, &world, &seed, &[]);
     }
 
+    // --- Grid tests ---
+
     #[test]
-    fn test_draw_grid_accent_pixels() {
+    fn test_draw_grid_modifies_pixels() {
         let (w, h) = (400, 200);
         let seed = test_seed();
         let world = test_world(VelocityTier::Cruise);
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+        let horizon_y = world.camera.horizon_y(h);
 
-        // Render road only
         let mut fb_road = ImageBuffer::new(w, h);
-        draw_road(&mut fb_road, w, h, horizon_y, &world, &seed);
+        draw_road(&mut fb_road, w, h, horizon_y, &world, &seed, &[]);
 
-        // Render road + grid
         let mut fb_grid = ImageBuffer::new(w, h);
-        draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed);
-        draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed);
+        draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed, &[]);
+        draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed, &[]);
 
-        // Count pixels that changed between road-only and road+grid
         let changed = fb_road
             .enumerate_pixels()
             .filter(|(x, y, p)| *y > horizon_y && fb_grid.get_pixel(*x, *y) != *p)
             .count();
-
-        assert!(
-            changed > 0,
-            "Grid should modify at least some pixels on road"
-        );
-    }
-
-    #[test]
-    fn test_draw_grid_alpha_blended() {
-        let (w, h) = (400, 200);
-        let mut fb = ImageBuffer::new(w, h);
-        let seed = test_seed();
-        let world = test_world(VelocityTier::Cruise);
-        let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
-
-        draw_road(&mut fb, w, h, horizon_y, &world, &seed);
-        draw_grid(&mut fb, w, h, horizon_y, &world, &seed);
-
-        // Grid lines should NOT be pure accent color (they're alpha-blended)
-        let accent = hue_to_neon(seed.accent_hue);
-        let pure_accent_count = fb
-            .pixels()
-            .filter(|p| p.0[0] == accent.0[0] && p.0[1] == accent.0[1] && p.0[2] == accent.0[2])
-            .count();
-        // Some might accidentally match, but it shouldn't be many
-        assert!(
-            pure_accent_count < 10,
-            "Grid pixels should be blended, not pure accent ({pure_accent_count} pure)"
-        );
+        assert!(changed > 0, "Grid should modify at least some pixels");
     }
 
     #[test]
@@ -535,87 +389,91 @@ mod tests {
         let (w, h) = (400, 200);
         let seed = test_seed();
 
-        // Helper: render road+grid, return set of Y rows that grid modified
-        let grid_rows = |camera_z: f32| -> std::collections::HashSet<u32> {
+        // Count horizontal grid line rows (full-width changes)
+        let hline_rows = |camera_z: f32| -> std::collections::HashSet<u32> {
             let mut world = test_world(VelocityTier::Cruise);
             world.camera_z = camera_z;
-            let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+            world.camera.z = camera_z;
+            let horizon_y = world.camera.horizon_y(h);
 
             let mut fb_road = ImageBuffer::new(w, h);
-            draw_road(&mut fb_road, w, h, horizon_y, &world, &seed);
+            draw_road(&mut fb_road, w, h, horizon_y, &world, &seed, &[]);
 
             let mut fb_grid = ImageBuffer::new(w, h);
-            draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed);
-            draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed);
+            draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed, &[]);
+            draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed, &[]);
 
             let mut rows = std::collections::HashSet::new();
             for y in (horizon_y + 1)..h {
-                for x in 0..w {
-                    if fb_grid.get_pixel(x, y) != fb_road.get_pixel(x, y) {
-                        rows.insert(y);
-                        break;
-                    }
+                // Count how many pixels changed on this row
+                let changed = (0..w)
+                    .filter(|&x| fb_grid.get_pixel(x, y) != fb_road.get_pixel(x, y))
+                    .count();
+                // Horizontal line modifies most of the row
+                if changed > w as usize / 2 {
+                    rows.insert(y);
                 }
             }
             rows
         };
 
-        let rows_a = grid_rows(0.0);
-        let rows_b = grid_rows(2.5); // half grid_spacing
+        let rows_a = hline_rows(0.0);
+        let rows_b = hline_rows(62.5);
 
         assert!(
             !rows_a.is_empty(),
-            "Grid should produce visible lines at camera_z=0"
+            "Grid should produce visible hlines at camera_z=0"
         );
         assert!(
             !rows_b.is_empty(),
-            "Grid should produce visible lines at camera_z=2.5"
+            "Grid should produce visible hlines at camera_z=62.5"
         );
         assert_ne!(
             rows_a, rows_b,
-            "Grid lines should be at different Y positions when camera_z differs"
+            "Hlines should be at different Y positions when camera_z differs"
         );
     }
 
     #[test]
-    fn test_draw_grid_line_count_stable() {
+    fn test_draw_grid_hline_count_stable() {
         let (w, h) = (400, 200);
         let seed = test_seed();
 
-        let count_grid_rows = |camera_z: f32| -> usize {
+        let count_hlines = |camera_z: f32| -> usize {
             let mut world = test_world(VelocityTier::Cruise);
             world.camera_z = camera_z;
-            let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+            world.camera.z = camera_z;
+            let horizon_y = world.camera.horizon_y(h);
 
             let mut fb_road = ImageBuffer::new(w, h);
-            draw_road(&mut fb_road, w, h, horizon_y, &world, &seed);
+            draw_road(&mut fb_road, w, h, horizon_y, &world, &seed, &[]);
 
             let mut fb_grid = ImageBuffer::new(w, h);
-            draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed);
-            draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed);
+            draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed, &[]);
+            draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed, &[]);
 
             let mut count = 0;
             for y in (horizon_y + 1)..h {
-                for x in 0..w {
-                    if fb_grid.get_pixel(x, y) != fb_road.get_pixel(x, y) {
-                        count += 1;
-                        break;
-                    }
+                let changed = (0..w)
+                    .filter(|&x| fb_grid.get_pixel(x, y) != fb_road.get_pixel(x, y))
+                    .count();
+                if changed > w as usize / 2 {
+                    count += 1;
                 }
             }
             count
         };
 
-        let counts: Vec<usize> = [0.0, 1.0, 2.5, 4.9, 5.0, 10.3]
+        let counts: Vec<usize> = [0.0, 25.0, 62.5, 122.5, 125.0, 257.5]
             .iter()
-            .map(|&cz| count_grid_rows(cz))
+            .map(|&cz| count_hlines(cz))
             .collect();
 
         let min = *counts.iter().min().unwrap();
         let max = *counts.iter().max().unwrap();
         assert!(
             max - min <= 1,
-            "Grid line count should stay stable across camera positions, got counts: {counts:?}"
+            "Horizontal grid line count should stay stable, got counts: {counts:?}"
         );
     }
 }

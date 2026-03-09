@@ -35,7 +35,62 @@ impl VelocityTier {
 }
 
 pub fn speed_target(commits_per_min: f32) -> f32 {
-    30.0 + (commits_per_min * 210.0).min(870.0)
+    10.0 + (commits_per_min * 70.0).min(290.0)
+}
+
+// ---------------------------------------------------------------------------
+// 6-gear transmission model
+// ---------------------------------------------------------------------------
+
+pub const GEAR_COUNT: u8 = 6;
+pub const RPM_IDLE: f32 = 1000.0;
+pub const RPM_REDLINE: f32 = 8000.0;
+pub const RPM_UPSHIFT: f32 = 7500.0;
+pub const RPM_DOWNSHIFT: f32 = 2000.0;
+pub const SHIFT_COOLDOWN: f32 = 0.15; // seconds of reduced power during shift
+
+/// Gear ratios — higher ratio = more torque, less top speed.
+/// Index 0 = gear 1, index 5 = gear 6.
+pub const GEAR_RATIOS: [f32; 6] = [3.5, 2.5, 1.8, 1.3, 1.0, 0.8];
+
+/// Final drive converts RPM×ratio into road speed units.
+pub const FINAL_DRIVE: f32 = 0.012;
+
+/// Torque curve: peaks mid-range, falls off at low and high RPM.
+/// Returns 0.0–1.0 torque multiplier for given RPM.
+pub fn torque_at_rpm(rpm: f32) -> f32 {
+    // Normalized rpm in 0..1 range
+    let t = ((rpm - RPM_IDLE) / (RPM_REDLINE - RPM_IDLE)).clamp(0.0, 1.0);
+    // Bell curve peaking at ~0.6 (≈5200 RPM)
+    let peak = 0.6;
+    let spread = 0.35;
+    let x = (t - peak) / spread;
+    (1.0 - x * x).max(0.15)
+}
+
+/// Convert RPM + gear to road speed.
+pub fn rpm_to_speed(rpm: f32, gear: u8) -> f32 {
+    let ratio = GEAR_RATIOS[gear.clamp(0, 5) as usize];
+    rpm * FINAL_DRIVE / ratio
+}
+
+/// Convert road speed + gear to RPM.
+pub fn speed_to_rpm(speed: f32, gear: u8) -> f32 {
+    let ratio = GEAR_RATIOS[gear.clamp(0, 5) as usize];
+    (speed * ratio / FINAL_DRIVE).clamp(RPM_IDLE, RPM_REDLINE)
+}
+
+/// Determine which gear should be selected for a target speed.
+/// Returns 0-based gear index.
+pub fn gear_for_speed(speed: f32) -> u8 {
+    // Find the lowest gear where the speed doesn't exceed redline
+    for g in 0..GEAR_COUNT {
+        let rpm = speed_to_rpm(speed, g);
+        if rpm < RPM_UPSHIFT {
+            return g;
+        }
+    }
+    GEAR_COUNT - 1
 }
 
 #[cfg(test)]
@@ -118,28 +173,28 @@ mod tests {
     #[test]
     fn test_speed_target_flatline() {
         let s = speed_target(0.0);
-        assert!((s - 30.0).abs() < 0.001, "expected 30.0, got {s}");
+        assert!((s - 10.0).abs() < 0.001, "expected 10.0, got {s}");
     }
 
     #[test]
     fn test_speed_target_mid() {
-        // 2.0 * 210.0 = 420.0 → 30.0 + 420.0 = 450.0
+        // 2.0 * 70.0 = 140.0 → 10.0 + 140.0 = 150.0
         let s = speed_target(2.0);
-        assert!((s - 450.0).abs() < 0.001, "expected 450.0, got {s}");
+        assert!((s - 150.0).abs() < 0.001, "expected 150.0, got {s}");
     }
 
     #[test]
     fn test_speed_target_cap() {
-        // 100.0 * 210.0 = 21000.0, capped at 870.0 → 30.0 + 870.0 = 900.0
+        // 100.0 * 70.0 = 7000.0, capped at 290.0 → 10.0 + 290.0 = 300.0
         let s = speed_target(100.0);
-        assert!((s - 900.0).abs() < 0.001, "expected 900.0, got {s}");
+        assert!((s - 300.0).abs() < 0.001, "expected 300.0, got {s}");
     }
 
     #[test]
     fn test_speed_target_at_vdemon_threshold() {
-        // 4.0 * 210.0 = 840.0 → 30.0 + 840.0 = 870.0
+        // 4.0 * 70.0 = 280.0 → 10.0 + 280.0 = 290.0
         let s = speed_target(4.0);
-        assert!((s - 870.0).abs() < 0.001, "expected 870.0, got {s}");
+        assert!((s - 290.0).abs() < 0.001, "expected 290.0, got {s}");
     }
 
     // --- name ---
