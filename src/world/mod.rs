@@ -37,8 +37,8 @@ impl WorldState {
         Self {
             z_offset: 0.0,
             camera_z: 0.0,
-            speed: 1.5,
-            speed_target: 1.5 + seed.speed_base * 2.8,
+            speed: 0.4,
+            speed_target: 0.4 + seed.speed_base * 2.8,
             commits_per_min: 0.0,
             lines_added: 0,
             lines_deleted: 0,
@@ -143,5 +143,314 @@ impl WorldState {
 
     pub fn sector(&self) -> u64 {
         self.total_commits / 100
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::poller::{CommitSummary, PollResult};
+    use crate::git::seed::RepoSeed;
+    use image::Rgba;
+    use std::collections::HashMap;
+
+    fn test_seed() -> RepoSeed {
+        RepoSeed {
+            accent_hue: 180.0,
+            saturation: 0.8,
+            terrain_roughness: 0.5,
+            speed_base: 0.5,
+            author_colors: {
+                let mut m = HashMap::new();
+                m.insert("Alice".to_string(), Rgba([100, 200, 100, 255]));
+                m
+            },
+            total_commits: 250,
+            repo_name: "test-repo".to_string(),
+        }
+    }
+
+    fn empty_poll(cpm: f32) -> PollResult {
+        PollResult {
+            commits: Vec::new(),
+            commits_per_min: cpm,
+            lines_added: 0,
+            lines_deleted: 0,
+            files_changed: 0,
+            window_minutes: 30,
+            polled_at: chrono::Utc::now(),
+        }
+    }
+
+    fn poll_with_commit(message: &str, author: &str, added: u32, deleted: u32, cpm: f32) -> PollResult {
+        PollResult {
+            commits: vec![CommitSummary {
+                sha_short: "abc1234".to_string(),
+                message: message.to_string(),
+                author: author.to_string(),
+                lines_added: added,
+                lines_deleted: deleted,
+                files_changed: 1,
+                timestamp: chrono::Utc::now(),
+            }],
+            commits_per_min: cpm,
+            lines_added: added,
+            lines_deleted: deleted,
+            files_changed: 1,
+            window_minutes: 30,
+            polled_at: chrono::Utc::now(),
+        }
+    }
+
+    // --- WorldState::new ---
+
+    #[test]
+    fn test_new_defaults() {
+        let seed = test_seed();
+        let w = WorldState::new(&seed);
+        assert_eq!(w.z_offset, 0.0);
+        assert_eq!(w.camera_z, 0.0);
+        assert!((w.speed - 0.4).abs() < 0.001);
+        assert!((w.speed_target - (0.4 + 0.5 * 2.8)).abs() < 0.001);
+        assert_eq!(w.commits_per_min, 0.0);
+        assert_eq!(w.tier, VelocityTier::Flatline);
+        assert_eq!(w.total_commits, 250);
+        assert!(w.pending_objects.is_empty());
+        assert!(w.active_objects.is_empty());
+    }
+
+    // --- WorldState::update ---
+
+    #[test]
+    fn test_update_speed_lerp() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        // Set cpm so speed_target remains high after recomputation
+        // speed_target(2.0) = 0.4 + 5.6 = 6.0
+        w.commits_per_min = 2.0;
+        w.speed = 1.0;
+        let old_speed = w.speed;
+        w.update(0.1);
+        // speed += (target - 1.0) * 4.0 * 0.1 → speed increases
+        assert!(w.speed > old_speed, "speed should increase toward target");
+        assert!(w.speed < 6.0, "speed should not overshoot target");
+    }
+
+    #[test]
+    fn test_update_z_advances() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.speed = 2.0;
+        w.speed_target = 2.0;
+        let dt = 0.5;
+        w.update(dt);
+        // z_offset and camera_z advance by speed * dt = 2.0 * 0.5 = 1.0
+        // (speed changes slightly during update due to lerp, but target==speed so minimal)
+        assert!(w.z_offset > 0.0);
+        assert!(w.camera_z > 0.0);
+    }
+
+    #[test]
+    fn test_update_time_advances() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.update(0.016);
+        assert!((w.time - 0.016).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_update_tier_recomputed() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.commits_per_min = 2.0;
+        w.update(0.016);
+        assert_eq!(w.tier, VelocityTier::Demon);
+    }
+
+    #[test]
+    fn test_update_despawn() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        // Place an object behind camera
+        w.active_objects.push((
+            objects::Lane::Left,
+            -10.0, // well behind camera_z=0
+            RoadsideObject::VelocitySign { commits_per_min: 1.0 },
+        ));
+        assert_eq!(w.active_objects.len(), 1);
+        w.update(0.016);
+        assert_eq!(w.active_objects.len(), 0, "object behind camera should be despawned");
+    }
+
+    #[test]
+    fn test_update_spawn_pending() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.pending_objects.push_back(RoadsideObject::VelocitySign { commits_per_min: 1.0 });
+        w.pending_objects.push_back(RoadsideObject::VelocitySign { commits_per_min: 2.0 });
+        assert_eq!(w.active_objects.len(), 0);
+        w.update(0.016);
+        assert_eq!(w.active_objects.len(), 2, "pending objects should be spawned");
+        assert!(w.pending_objects.is_empty(), "pending queue should be drained");
+    }
+
+    #[test]
+    fn test_lane_alternation() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        for _ in 0..4 {
+            w.pending_objects.push_back(RoadsideObject::VelocitySign { commits_per_min: 1.0 });
+        }
+        w.update(0.016);
+        let lanes: Vec<_> = w.active_objects.iter().map(|(l, _, _)| *l).collect();
+        assert_eq!(lanes[0], objects::Lane::Left);
+        assert_eq!(lanes[1], objects::Lane::Right);
+        assert_eq!(lanes[2], objects::Lane::Left);
+        assert_eq!(lanes[3], objects::Lane::Right);
+    }
+
+    // --- WorldState::ingest_poll ---
+
+    #[test]
+    fn test_ingest_poll_creates_billboard() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        let poll = poll_with_commit("fix bug", "Alice", 10, 5, 0.1);
+        w.ingest_poll(&poll, &seed);
+        let has_billboard = w.pending_objects.iter().any(|o| {
+            matches!(o, RoadsideObject::CommitBillboard { .. })
+        });
+        assert!(has_billboard, "commit should produce CommitBillboard");
+    }
+
+    #[test]
+    fn test_ingest_poll_creates_addition_tower() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        let poll = poll_with_commit("big feature", "Alice", 100, 0, 0.1);
+        w.ingest_poll(&poll, &seed);
+        let has_tower = w.pending_objects.iter().any(|o| {
+            matches!(o, RoadsideObject::AdditionTower { .. })
+        });
+        assert!(has_tower, ">50 lines_added should produce AdditionTower");
+    }
+
+    #[test]
+    fn test_ingest_poll_no_tower_small_addition() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        let poll = poll_with_commit("small fix", "Alice", 30, 0, 0.1);
+        w.ingest_poll(&poll, &seed);
+        let has_tower = w.pending_objects.iter().any(|o| {
+            matches!(o, RoadsideObject::AdditionTower { .. })
+        });
+        assert!(!has_tower, "<=50 lines_added should not produce AdditionTower");
+    }
+
+    #[test]
+    fn test_ingest_poll_creates_deletion_shard() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        let poll = poll_with_commit("cleanup", "Alice", 0, 80, 0.1);
+        w.ingest_poll(&poll, &seed);
+        let has_shard = w.pending_objects.iter().any(|o| {
+            matches!(o, RoadsideObject::DeletionShard { .. })
+        });
+        assert!(has_shard, ">50 lines_deleted should produce DeletionShard");
+    }
+
+    #[test]
+    fn test_ingest_poll_tier_gate_on_change() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        assert_eq!(w.tier, VelocityTier::Flatline);
+        let poll = empty_poll(0.5); // Active tier
+        w.ingest_poll(&poll, &seed);
+        let has_gate = w.active_objects.iter().any(|(_, _, o)| {
+            matches!(o, RoadsideObject::TierGate { .. })
+        });
+        assert!(has_gate, "tier change should spawn TierGate in active_objects");
+        // TierGate should be at camera_z + NEAR_SPAWN
+        let gate_z = w.active_objects.iter()
+            .find_map(|(_, z, o)| matches!(o, RoadsideObject::TierGate { .. }).then_some(*z))
+            .unwrap();
+        assert!((gate_z - NEAR_SPAWN).abs() < 0.1, "TierGate should be at NEAR_SPAWN");
+    }
+
+    #[test]
+    fn test_ingest_poll_no_tier_gate_same_tier() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        // First poll: set tier to Active
+        let poll1 = empty_poll(0.5);
+        w.ingest_poll(&poll1, &seed);
+        w.tier = VelocityTier::Active; // sync tier
+
+        // Second poll: same cpm, same tier
+        let poll2 = empty_poll(0.5);
+        let gates_before = w.active_objects.iter()
+            .filter(|(_, _, o)| matches!(o, RoadsideObject::TierGate { .. }))
+            .count();
+        w.ingest_poll(&poll2, &seed);
+        let gates_after = w.active_objects.iter()
+            .filter(|(_, _, o)| matches!(o, RoadsideObject::TierGate { .. }))
+            .count();
+        assert_eq!(gates_after, gates_before, "same tier should not spawn another TierGate");
+    }
+
+    #[test]
+    fn test_ingest_poll_curve_shift_on_burst() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        assert_eq!(w.curve_target, 0.0);
+        let poll = empty_poll(1.5); // > 1.0, should trigger curve shift
+        w.ingest_poll(&poll, &seed);
+        // curve_target is randomized, just check it's in range
+        assert!(w.curve_target >= -60.0 && w.curve_target <= 60.0);
+    }
+
+    #[test]
+    fn test_ingest_poll_no_curve_shift_low_cpm() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        let poll = empty_poll(0.5); // <= 1.0
+        w.ingest_poll(&poll, &seed);
+        assert_eq!(w.curve_target, 0.0, "low cpm should not shift curve_target");
+    }
+
+    // --- draw_distance ---
+
+    #[test]
+    fn test_draw_distance_normal() {
+        let seed = test_seed();
+        let w = WorldState::new(&seed);
+        assert!((w.draw_distance() - 200.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_draw_distance_velocity_demon() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.tier = VelocityTier::VelocityDemon;
+        assert!((w.draw_distance() - 240.0).abs() < 0.1);
+    }
+
+    // --- sector ---
+
+    #[test]
+    fn test_sector() {
+        let seed = test_seed();
+        let w = WorldState::new(&seed);
+        assert_eq!(w.sector(), 2); // 250 / 100 = 2
+    }
+
+    // --- tier_index ---
+
+    #[test]
+    fn test_tier_index() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.tier = VelocityTier::Demon;
+        assert_eq!(w.tier_index(), 3);
     }
 }
