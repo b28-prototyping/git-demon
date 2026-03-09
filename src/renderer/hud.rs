@@ -261,6 +261,7 @@ mod tests {
                 segs
             },
             segment_z_start: 0.0,
+            burst_cooldown: 0.0,
         }
     }
 
