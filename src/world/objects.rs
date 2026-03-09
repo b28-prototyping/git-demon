@@ -10,11 +10,13 @@ pub enum Lane {
     Left,
     Right,
     Center,
+    RoadLeft,
+    RoadRight,
 }
 
 #[derive(Debug, Clone)]
 pub enum RoadsideObject {
-    CommitBillboard {
+    CommitCar {
         message: String,
         author: String,
         author_color: Rgba<u8>,
@@ -64,7 +66,7 @@ pub fn ingest_poll_to_queue(
             .copied()
             .unwrap_or(Rgba([200, 200, 200, 255]));
 
-        queue.push_back(RoadsideObject::CommitBillboard {
+        queue.push_back(RoadsideObject::CommitCar {
             message: truncate(&commit.message, 28),
             author: commit.author.clone(),
             author_color,
