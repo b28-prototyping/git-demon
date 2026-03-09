@@ -75,3 +75,5 @@ All 9 acceptance criteria are met by the existing implementation:
 1. **Grid depth_scale vs depth inconsistency**: `draw_grid` uses `depth_scale` (world-Z based) for road width interpolation but `depth` (screen-Y based) for curve shift. This is likely intentional for correct visual spacing but could produce subtle alignment artifacts at extreme depths. Low risk.
 
 2. **Pre-existing clippy warnings**: `BLOOM_STRENGTH` unused in `effects.rs`, `proto` assignment in `main.rs`. Not introduced by this ticket.
+
+3. **`world.steer_angle` in dev overlay**: `draw_dev_overlay` in `hud.rs` references `world.steer_angle` — a field added by a concurrent ticket. Currently compiles, but if that ticket's changes are reverted, the dev overlay would break. Out of scope for this ticket.
