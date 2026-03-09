@@ -51,6 +51,8 @@ pub struct WorldState {
     pub segments: Vec<RoadSegment>,
     /// World-Z of the first segment's start.
     pub segment_z_start: f32,
+    /// Remaining burst cooldown (set on high-cpm poll, decays each frame).
+    pub burst_cooldown: f32,
 }
 
 const SPAWN_DISTANCE: f32 = 2500.0;
@@ -96,7 +98,21 @@ impl WorldState {
                 segs
             },
             segment_z_start: 0.0,
+            burst_cooldown: 0.0,
         }
+    }
+
+    /// Sample the road slope at the camera's current position.
+    fn slope_at_camera(&self) -> f32 {
+        if self.segments.is_empty() {
+            return 0.0;
+        }
+        let offset = self.camera_z - self.segment_z_start;
+        let idx = (offset / road_segments::SEGMENT_LENGTH) as usize;
+        self.segments
+            .get(idx)
+            .map(|s| s.slope)
+            .unwrap_or(0.0)
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -150,9 +166,21 @@ impl WorldState {
 
         self.z_offset += self.speed * dt;
         self.camera_z += self.speed * dt;
-        // Sync camera with world state (camera_z is the source of truth during migration)
+
+        // Decay burst cooldown
+        self.burst_cooldown = (self.burst_cooldown - dt).max(0.0);
+
+        // Update camera with dynamic response
         self.camera.z = self.camera_z;
-        self.camera.sync(self.speed, self.tier);
+        let slope = self.slope_at_camera();
+        self.camera.update(
+            dt,
+            self.speed,
+            self.curve_offset,
+            slope,
+            self.tier,
+            self.time,
+        );
 
         // Recycle road segments: drop those behind camera, append new at far end
         while !self.segments.is_empty()
@@ -242,6 +270,9 @@ impl WorldState {
             use rand::RngExt;
             let mut rng = rand::rng();
             self.curve_target = rng.random_range(-60.0..60.0);
+            // Trigger camera burst zoom
+            self.burst_cooldown = 0.5;
+            self.camera.trigger_burst();
         }
     }
 
