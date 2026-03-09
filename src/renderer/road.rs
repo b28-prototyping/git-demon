@@ -8,7 +8,8 @@ const BASE_HORIZON_RATIO: f32 = 0.35;
 const ROAD_MIN_HALF: f32 = 8.0;
 const ROAD_MAX_HALF: f32 = 480.0;
 const RUMBLE_WIDTH: u32 = 12;
-const STRIPE_PERIOD: f32 = 1.0;
+const PERSPECTIVE_SCALE: f32 = 10.0;
+const STRIPE_PERIOD: f32 = 6.0;
 
 const STRIPE_LIGHT: Rgba<u8> = Rgba([90, 90, 90, 255]);
 const STRIPE_DARK: Rgba<u8> = Rgba([70, 70, 70, 255]);
@@ -61,7 +62,10 @@ pub fn draw_road(
         let road_l = (cx - road_half).max(0.0) as u32;
         let road_r = ((cx + road_half) as u32).min(w - 1);
 
-        let stripe = ((world.z_offset / depth.max(0.01)) % (STRIPE_PERIOD * 2.0)) < STRIPE_PERIOD;
+        // Perspective projection: SCALE/depth gives world-Z for this scanline,
+        // z_offset scrolls uniformly so stripes appear/disappear at equal rates.
+        let world_z = PERSPECTIVE_SCALE / depth.max(0.01) + world.z_offset;
+        let stripe = (world_z % (STRIPE_PERIOD * 2.0)) < STRIPE_PERIOD;
 
         let road_color = if stripe { STRIPE_LIGHT } else { STRIPE_DARK };
         let verge_color = if stripe { VERGE_A } else { VERGE_B };
@@ -105,10 +109,14 @@ pub fn draw_grid(
     let cx_base = w as f32 / 2.0;
     let accent = hue_to_neon(seed.accent_hue);
 
-    // Horizontal grid lines at regular world-Z intervals
+    // Horizontal grid lines at regular world-Z intervals, scrolling with camera
     let grid_spacing = 5.0_f32;
+    let camera_offset = world.camera_z % grid_spacing;
     for i in 1..40 {
-        let z_world = i as f32 * grid_spacing;
+        let z_world = i as f32 * grid_spacing - camera_offset;
+        if z_world <= 0.0 {
+            continue;
+        }
         let depth_scale = (1.0 - z_world / world.draw_distance()).clamp(0.0, 1.0);
         if depth_scale < 0.02 {
             continue;
@@ -517,6 +525,95 @@ mod tests {
         assert!(
             pure_accent_count < 10,
             "Grid pixels should be blended, not pure accent ({pure_accent_count} pure)"
+        );
+    }
+
+    #[test]
+    fn test_draw_grid_lines_move_with_camera() {
+        let (w, h) = (400, 200);
+        let seed = test_seed();
+
+        // Helper: render road+grid, return set of Y rows that grid modified
+        let grid_rows = |camera_z: f32| -> std::collections::HashSet<u32> {
+            let mut world = test_world(VelocityTier::Cruise);
+            world.camera_z = camera_z;
+            let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+
+            let mut fb_road = ImageBuffer::new(w, h);
+            draw_road(&mut fb_road, w, h, horizon_y, &world, &seed);
+
+            let mut fb_grid = ImageBuffer::new(w, h);
+            draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed);
+            draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed);
+
+            let mut rows = std::collections::HashSet::new();
+            for y in (horizon_y + 1)..h {
+                for x in 0..w {
+                    if fb_grid.get_pixel(x, y) != fb_road.get_pixel(x, y) {
+                        rows.insert(y);
+                        break;
+                    }
+                }
+            }
+            rows
+        };
+
+        let rows_a = grid_rows(0.0);
+        let rows_b = grid_rows(2.5); // half grid_spacing
+
+        assert!(
+            !rows_a.is_empty(),
+            "Grid should produce visible lines at camera_z=0"
+        );
+        assert!(
+            !rows_b.is_empty(),
+            "Grid should produce visible lines at camera_z=2.5"
+        );
+        assert_ne!(
+            rows_a, rows_b,
+            "Grid lines should be at different Y positions when camera_z differs"
+        );
+    }
+
+    #[test]
+    fn test_draw_grid_line_count_stable() {
+        let (w, h) = (400, 200);
+        let seed = test_seed();
+
+        let count_grid_rows = |camera_z: f32| -> usize {
+            let mut world = test_world(VelocityTier::Cruise);
+            world.camera_z = camera_z;
+            let horizon_y = (h as f32 * horizon_ratio(&world)) as u32;
+
+            let mut fb_road = ImageBuffer::new(w, h);
+            draw_road(&mut fb_road, w, h, horizon_y, &world, &seed);
+
+            let mut fb_grid = ImageBuffer::new(w, h);
+            draw_road(&mut fb_grid, w, h, horizon_y, &world, &seed);
+            draw_grid(&mut fb_grid, w, h, horizon_y, &world, &seed);
+
+            let mut count = 0;
+            for y in (horizon_y + 1)..h {
+                for x in 0..w {
+                    if fb_grid.get_pixel(x, y) != fb_road.get_pixel(x, y) {
+                        count += 1;
+                        break;
+                    }
+                }
+            }
+            count
+        };
+
+        let counts: Vec<usize> = [0.0, 1.0, 2.5, 4.9, 5.0, 10.3]
+            .iter()
+            .map(|&cz| count_grid_rows(cz))
+            .collect();
+
+        let min = *counts.iter().min().unwrap();
+        let max = *counts.iter().max().unwrap();
+        assert!(
+            max - min <= 1,
+            "Grid line count should stay stable across camera positions, got counts: {counts:?}"
         );
     }
 }
