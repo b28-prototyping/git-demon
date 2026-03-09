@@ -64,8 +64,10 @@ pub fn draw_road(
 
         // Perspective projection: SCALE/depth gives world-Z for this scanline,
         // z_offset scrolls uniformly so stripes appear/disappear at equal rates.
+        // Scale period with speed to prevent wagon-wheel aliasing at high multipliers.
+        let period = STRIPE_PERIOD * (1.0 + world.speed * 0.05);
         let world_z = PERSPECTIVE_SCALE / depth.max(0.01) + world.z_offset;
-        let stripe = (world_z % (STRIPE_PERIOD * 2.0)) < STRIPE_PERIOD;
+        let stripe = (world_z % (period * 2.0)) < period;
 
         let road_color = if stripe { STRIPE_LIGHT } else { STRIPE_DARK };
         let verge_color = if stripe { VERGE_A } else { VERGE_B };

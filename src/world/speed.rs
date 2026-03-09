@@ -35,7 +35,7 @@ impl VelocityTier {
 }
 
 pub fn speed_target(commits_per_min: f32) -> f32 {
-    0.4 + (commits_per_min * 2.8).min(11.6)
+    30.0 + (commits_per_min * 210.0).min(870.0)
 }
 
 #[cfg(test)]
@@ -118,28 +118,28 @@ mod tests {
     #[test]
     fn test_speed_target_flatline() {
         let s = speed_target(0.0);
-        assert!((s - 0.4).abs() < 0.001, "expected 0.4, got {s}");
+        assert!((s - 30.0).abs() < 0.001, "expected 30.0, got {s}");
     }
 
     #[test]
     fn test_speed_target_mid() {
-        // 2.0 * 2.8 = 5.6 → 0.4 + 5.6 = 6.0
+        // 2.0 * 210.0 = 420.0 → 30.0 + 420.0 = 450.0
         let s = speed_target(2.0);
-        assert!((s - 6.0).abs() < 0.001, "expected 6.0, got {s}");
+        assert!((s - 450.0).abs() < 0.001, "expected 450.0, got {s}");
     }
 
     #[test]
     fn test_speed_target_cap() {
-        // 100.0 * 2.8 = 280.0, capped at 11.6 → 0.4 + 11.6 = 12.0
+        // 100.0 * 210.0 = 21000.0, capped at 870.0 → 30.0 + 870.0 = 900.0
         let s = speed_target(100.0);
-        assert!((s - 12.0).abs() < 0.001, "expected 12.0, got {s}");
+        assert!((s - 900.0).abs() < 0.001, "expected 900.0, got {s}");
     }
 
     #[test]
     fn test_speed_target_at_vdemon_threshold() {
-        // 4.0 * 2.8 = 11.2 → 0.4 + 11.2 = 11.6
+        // 4.0 * 210.0 = 840.0 → 30.0 + 840.0 = 870.0
         let s = speed_target(4.0);
-        assert!((s - 11.6).abs() < 0.001, "expected 11.6, got {s}");
+        assert!((s - 870.0).abs() < 0.001, "expected 870.0, got {s}");
     }
 
     // --- name ---

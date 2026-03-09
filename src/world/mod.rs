@@ -43,8 +43,8 @@ impl WorldState {
         Self {
             z_offset: 0.0,
             camera_z: 0.0,
-            speed: 0.4,
-            speed_target: 0.4 + seed.speed_base * 2.8,
+            speed: 30.0,
+            speed_target: 30.0 + seed.speed_base * 210.0,
             commits_per_min: 0.0,
             lines_added: 0,
             lines_deleted: 0,
@@ -235,8 +235,8 @@ mod tests {
         let w = WorldState::new(&seed);
         assert_eq!(w.z_offset, 0.0);
         assert_eq!(w.camera_z, 0.0);
-        assert!((w.speed - 0.4).abs() < 0.001);
-        assert!((w.speed_target - (0.4 + 0.5 * 2.8)).abs() < 0.001);
+        assert!((w.speed - 30.0).abs() < 0.001);
+        assert!((w.speed_target - (30.0 + 0.5 * 210.0)).abs() < 0.001);
         assert_eq!(w.commits_per_min, 0.0);
         assert_eq!(w.tier, VelocityTier::Flatline);
         assert_eq!(w.total_commits, 250);
@@ -251,14 +251,13 @@ mod tests {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         // Set cpm so speed_target remains high after recomputation
-        // speed_target(2.0) = 0.4 + 5.6 = 6.0
+        // speed_target(2.0) = 30.0 + 420.0 = 450.0
         w.commits_per_min = 2.0;
         w.speed = 1.0;
         let old_speed = w.speed;
         w.update(0.1);
-        // speed += (target - 1.0) * 4.0 * 0.1 → speed increases
         assert!(w.speed > old_speed, "speed should increase toward target");
-        assert!(w.speed < 6.0, "speed should not overshoot target");
+        assert!(w.speed < 450.0, "speed should not overshoot target");
     }
 
     #[test]
