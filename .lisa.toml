@@ -1,0 +1,12 @@
+# Lisa project configuration
+version = "0.2.8"
+
+[dirs]
+tickets = "docs/active/tickets"
+stories = "docs/active/stories"
+work = "docs/active/work"
+
+[scheduling]
+max_threads = 2
+# auto_advance = false
+# review_timeout_secs = 240

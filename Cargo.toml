@@ -1,0 +1,27 @@
+[package]
+name = "git-demon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A sci-fi cyber racecar screensaver for your terminal, driven by live git activity"
+
+[dependencies]
+ratatui           = "0.30"
+ratatui-image     = "10"
+crossterm         = "0.29"
+image             = "0.25"
+git2              = "0.20"
+noise             = "0.9"
+rand              = "0.10"
+rand_pcg          = "0.10"
+chrono            = "0.4"
+crossbeam-channel = "0.5"
+clap              = { version = "4", features = ["derive"] }
+anyhow            = "1"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "render"
+harness = false
