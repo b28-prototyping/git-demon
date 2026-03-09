@@ -6,7 +6,7 @@ use crate::world::speed::VelocityTier;
 use crate::world::WorldState;
 
 const HUD_HEIGHT: u32 = 18;
-const HUD_BG: Rgba<u8> = Rgba([0, 0, 0, 200]);
+const HUD_BG: Rgba<u8> = Rgba([0, 0, 0, 204]);
 
 pub fn draw_hud(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
@@ -73,23 +73,32 @@ pub fn draw_dev_overlay(
     seed: &RepoSeed,
     frame_count: u64,
     render_us: u128,
-    actual_fps: f32,
-    target_fps: u32,
+    world_fps: f32,
+    render_fps: f32,
+    target_render_fps: u32,
     encode_send_us: u128,
 ) {
     let lines = [
         "-- DEV --".to_string(),
         format!(
-            "frame: {}  render: {:.1}ms  fps: {:.1}/{}  enc: {:.1}ms",
+            "frame: {}  raster: {:.1}ms  enc: {:.1}ms",
             frame_count,
             render_us as f64 / 1000.0,
-            actual_fps,
-            target_fps,
             encode_send_us as f64 / 1000.0,
         ),
+        format!(
+            "world: {:.0}hz  render: {:.0}/{}fps",
+            world_fps, render_fps, target_render_fps,
+        ),
         format!("res: {}x{}", w, fb.height()),
-        format!("speed: {:.2} -> {:.2}", world.speed, world.speed_target),
-        format!("tier: {:?}", world.tier),
+        format!(
+            "speed: {:.2} -> {:.2}  x{:.1}",
+            world.speed, world.speed_target, world.speed_multiplier
+        ),
+        format!(
+            "tier: {:?}  curve_mul: {:.1}",
+            world.tier, world.curve_multiplier
+        ),
         format!("cpm: {:.2}", world.commits_per_min),
         format!("cam_z: {:.1}  z_off: {:.1}", world.camera_z, world.z_offset),
         format!(
@@ -152,7 +161,7 @@ pub fn draw_dev_overlay(
     }
 }
 
-fn tier_badge_color(world: &WorldState) -> Rgba<u8> {
+pub(crate) fn tier_badge_color(world: &WorldState) -> Rgba<u8> {
     match world.tier {
         VelocityTier::Flatline => Rgba([100, 100, 100, 255]),
         VelocityTier::Cruise => Rgba([255, 255, 255, 255]),
@@ -166,5 +175,227 @@ fn tier_badge_color(world: &WorldState) -> Rgba<u8> {
                 Rgba([255, 255, 255, 255])
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+
+    fn make_world() -> WorldState {
+        WorldState {
+            z_offset: 0.0,
+            camera_z: 0.0,
+            speed: 1.0,
+            speed_target: 1.0,
+            commits_per_min: 2.5,
+            lines_added: 42,
+            lines_deleted: 7,
+            files_changed: 3,
+            tier: VelocityTier::Active,
+            time: 0.0,
+            total_commits: 450,
+            pending_objects: VecDeque::new(),
+            active_objects: Vec::new(),
+            curve_offset: 0.0,
+            curve_target: 0.0,
+            steer_angle: 0.0,
+            speed_multiplier: 1.0,
+            curve_multiplier: 1.0,
+            speed_hold_time: 0.0,
+            curve_hold_time: 0.0,
+        }
+    }
+
+    fn make_seed() -> RepoSeed {
+        RepoSeed {
+            accent_hue: 180.0,
+            saturation: 0.8,
+            terrain_roughness: 0.5,
+            speed_base: 0.5,
+            author_colors: HashMap::new(),
+            total_commits: 450,
+            repo_name: "test-repo".into(),
+        }
+    }
+
+    // --- tier badge colors ---
+
+    #[test]
+    fn test_tier_badge_flatline() {
+        let mut world = make_world();
+        world.tier = VelocityTier::Flatline;
+        assert_eq!(tier_badge_color(&world), Rgba([100, 100, 100, 255]));
+    }
+
+    #[test]
+    fn test_tier_badge_cruise() {
+        let mut world = make_world();
+        world.tier = VelocityTier::Cruise;
+        assert_eq!(tier_badge_color(&world), Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn test_tier_badge_active() {
+        let mut world = make_world();
+        world.tier = VelocityTier::Active;
+        assert_eq!(tier_badge_color(&world), Rgba([0, 255, 255, 255]));
+    }
+
+    #[test]
+    fn test_tier_badge_demon() {
+        let mut world = make_world();
+        world.tier = VelocityTier::Demon;
+        assert_eq!(tier_badge_color(&world), Rgba([255, 165, 0, 255]));
+    }
+
+    #[test]
+    fn test_tier_badge_velocity_demon_strobe() {
+        let mut world = make_world();
+        world.tier = VelocityTier::VelocityDemon;
+
+        // At time=0.0: (0.0 * 4.0) as u32 = 0, 0 % 2 == 0 → red
+        world.time = 0.0;
+        assert_eq!(tier_badge_color(&world), Rgba([255, 0, 0, 255]));
+
+        // At time=0.25: (0.25 * 4.0) as u32 = 1, 1 % 2 != 0 → white
+        world.time = 0.26; // slightly past to avoid float boundary
+        assert_eq!(tier_badge_color(&world), Rgba([255, 255, 255, 255]));
+
+        // At time=0.50: (0.5 * 4.0) as u32 = 2, 2 % 2 == 0 → red
+        world.time = 0.50;
+        assert_eq!(tier_badge_color(&world), Rgba([255, 0, 0, 255]));
+    }
+
+    // --- HUD background alpha ---
+
+    #[test]
+    fn test_hud_background_alpha_blend() {
+        // Over a pure white background, HUD_BG (0,0,0,204) should produce:
+        // result = 0 * (204/255) + 255 * (1 - 204/255) = 255 * 51/255 = 51
+        let (w, h) = (600, 200);
+        let mut fb = ImageBuffer::from_pixel(w, h, Rgba([255, 255, 255, 255]));
+        let world = make_world();
+        let seed = make_seed();
+
+        draw_hud(&mut fb, w, h, &world, &seed);
+
+        let hud_y = h - HUD_HEIGHT;
+        // Check a pixel in the HUD region that should only have background
+        // (far left, below any text). The blend should darken white to ~51.
+        // But text may overlap, so check a pixel at x=0 which is before text starts at x=8
+        let p = fb.get_pixel(0, hud_y + 1);
+        // alpha = 204/255 ≈ 0.8, inv ≈ 0.2
+        // result = 0 * 0.8 + 255 * 0.2 = 51
+        let expected = (255.0 * (1.0 - 204.0 / 255.0)) as u8;
+        assert_eq!(
+            p.0[0], expected,
+            "Red channel: expected {expected}, got {}",
+            p.0[0]
+        );
+        assert_eq!(p.0[1], expected, "Green channel");
+        assert_eq!(p.0[2], expected, "Blue channel");
+        assert_eq!(p.0[3], 255, "Alpha should be fully opaque");
+    }
+
+    // --- HUD renders in correct region ---
+
+    #[test]
+    fn test_hud_modifies_bottom_strip() {
+        let (w, h) = (600, 200);
+        let mut fb = ImageBuffer::from_pixel(w, h, Rgba([128, 128, 128, 255]));
+        let world = make_world();
+        let seed = make_seed();
+
+        draw_hud(&mut fb, w, h, &world, &seed);
+
+        let hud_y = h - HUD_HEIGHT;
+        // At least some pixels in the HUD region should differ from the original 128
+        let mut changed = 0u32;
+        for y in hud_y..h {
+            for x in 0..w {
+                if fb.get_pixel(x, y).0[0] != 128 {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(changed > 0, "HUD should modify pixels in bottom strip");
+    }
+
+    #[test]
+    fn test_hud_does_not_modify_above_strip() {
+        let (w, h) = (600, 200);
+        let gray = Rgba([128, 128, 128, 255]);
+        let mut fb = ImageBuffer::from_pixel(w, h, gray);
+        let world = make_world();
+        let seed = make_seed();
+
+        draw_hud(&mut fb, w, h, &world, &seed);
+
+        let hud_y = h - HUD_HEIGHT;
+        // Pixels above the HUD strip should be unchanged
+        for y in 0..hud_y {
+            for x in 0..w {
+                assert_eq!(
+                    *fb.get_pixel(x, y),
+                    gray,
+                    "Pixel ({x},{y}) above HUD should be unchanged"
+                );
+            }
+        }
+    }
+
+    // --- sector calculation ---
+
+    #[test]
+    fn test_sector_calculation() {
+        let mut world = make_world();
+        world.total_commits = 450;
+        assert_eq!(world.sector(), 4); // 450 / 100 = 4
+    }
+
+    #[test]
+    fn test_sector_zero() {
+        let mut world = make_world();
+        world.total_commits = 50;
+        assert_eq!(world.sector(), 0); // 50 / 100 = 0
+    }
+
+    // --- repo name right-aligned ---
+
+    #[test]
+    fn test_repo_name_right_aligned() {
+        let (w, h) = (800, 200);
+        let mut fb = ImageBuffer::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+        let world = make_world();
+        let seed = make_seed();
+
+        draw_hud(&mut fb, w, h, &world, &seed);
+
+        let text_y = h - HUD_HEIGHT + 4;
+        let white = Rgba([255, 255, 255, 255]);
+
+        // The repo text should have white pixels near the right edge
+        let mut rightmost_white = 0u32;
+        for x in 0..w {
+            for y in text_y..(text_y + 7) {
+                if *fb.get_pixel(x, y) == white {
+                    rightmost_white = rightmost_white.max(x);
+                }
+            }
+        }
+        // Right edge of text should be within 8px + glyph width of right edge
+        assert!(
+            rightmost_white > w - 20,
+            "Rightmost white pixel at {rightmost_white}, expected near {w}"
+        );
+    }
+
+    // --- HUD_HEIGHT constant ---
+
+    #[test]
+    fn test_hud_height_is_18() {
+        assert_eq!(HUD_HEIGHT, 18);
     }
 }

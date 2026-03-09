@@ -25,6 +25,12 @@ pub struct WorldState {
     pub curve_offset: f32,
     pub curve_target: f32,
     pub steer_angle: f32,
+    pub speed_multiplier: f32,
+    pub curve_multiplier: f32,
+    /// How long Up/Down has been held continuously (for exponential ramp)
+    pub speed_hold_time: f32,
+    /// How long Left/Right has been held continuously (for exponential ramp)
+    pub curve_hold_time: f32,
 }
 
 const SPAWN_DISTANCE: f32 = 100.0;
@@ -51,25 +57,32 @@ impl WorldState {
             curve_offset: 0.0,
             curve_target: 0.0,
             steer_angle: 0.0,
+            speed_multiplier: 1.0,
+            curve_multiplier: 1.0,
+            speed_hold_time: 0.0,
+            curve_hold_time: 0.0,
         }
     }
 
     pub fn update(&mut self, dt: f32) {
         self.time += dt;
 
-        // Lerp speed toward target
-        self.speed += (self.speed_target - self.speed) * 4.0 * dt;
+        // Lerp speed toward target (with user multiplier)
+        let effective_target = self.speed_target * self.speed_multiplier;
+        self.speed += (effective_target - self.speed) * 4.0 * dt;
         self.z_offset += self.speed * dt;
         self.camera_z += self.speed * dt;
 
         // Auto-steering: gentle sinusoidal weave for visual interest
         // Two overlapping sine waves at different frequencies for organic feel
-        self.steer_angle = (self.time * 0.3).sin() * 40.0
+        let base_steer = (self.time * 0.3).sin() * 40.0
             + (self.time * 0.13).sin() * 25.0
             + (self.time * 0.07).sin() * 15.0;
+        self.steer_angle = base_steer * self.curve_multiplier;
 
         // Combine auto-steer with activity-driven curve
-        self.curve_offset += (self.curve_target + self.steer_angle - self.curve_offset) * 2.5 * dt;
+        let curve_target = self.curve_target * self.curve_multiplier;
+        self.curve_offset += (curve_target + self.steer_angle - self.curve_offset) * 2.5 * dt;
 
         // Update tier
         self.tier = VelocityTier::from_commits_per_min(self.commits_per_min);
@@ -85,6 +98,12 @@ impl WorldState {
                 let z = self.camera_z + SPAWN_DISTANCE + spacing * i as f32;
                 let lane = if matches!(obj, RoadsideObject::TierGate { .. }) {
                     objects::Lane::Center
+                } else if matches!(obj, RoadsideObject::CommitCar { .. }) {
+                    if lane_toggle {
+                        objects::Lane::RoadRight
+                    } else {
+                        objects::Lane::RoadLeft
+                    }
                 } else if lane_toggle {
                     objects::Lane::Right
                 } else {
@@ -182,7 +201,13 @@ mod tests {
         }
     }
 
-    fn poll_with_commit(message: &str, author: &str, added: u32, deleted: u32, cpm: f32) -> PollResult {
+    fn poll_with_commit(
+        message: &str,
+        author: &str,
+        added: u32,
+        deleted: u32,
+        cpm: f32,
+    ) -> PollResult {
         PollResult {
             commits: vec![CommitSummary {
                 sha_short: "abc1234".to_string(),
@@ -275,23 +300,40 @@ mod tests {
         w.active_objects.push((
             objects::Lane::Left,
             -10.0, // well behind camera_z=0
-            RoadsideObject::VelocitySign { commits_per_min: 1.0 },
+            RoadsideObject::VelocitySign {
+                commits_per_min: 1.0,
+            },
         ));
         assert_eq!(w.active_objects.len(), 1);
         w.update(0.016);
-        assert_eq!(w.active_objects.len(), 0, "object behind camera should be despawned");
+        assert_eq!(
+            w.active_objects.len(),
+            0,
+            "object behind camera should be despawned"
+        );
     }
 
     #[test]
     fn test_update_spawn_pending() {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
-        w.pending_objects.push_back(RoadsideObject::VelocitySign { commits_per_min: 1.0 });
-        w.pending_objects.push_back(RoadsideObject::VelocitySign { commits_per_min: 2.0 });
+        w.pending_objects.push_back(RoadsideObject::VelocitySign {
+            commits_per_min: 1.0,
+        });
+        w.pending_objects.push_back(RoadsideObject::VelocitySign {
+            commits_per_min: 2.0,
+        });
         assert_eq!(w.active_objects.len(), 0);
         w.update(0.016);
-        assert_eq!(w.active_objects.len(), 2, "pending objects should be spawned");
-        assert!(w.pending_objects.is_empty(), "pending queue should be drained");
+        assert_eq!(
+            w.active_objects.len(),
+            2,
+            "pending objects should be spawned"
+        );
+        assert!(
+            w.pending_objects.is_empty(),
+            "pending queue should be drained"
+        );
     }
 
     #[test]
@@ -299,7 +341,9 @@ mod tests {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         for _ in 0..4 {
-            w.pending_objects.push_back(RoadsideObject::VelocitySign { commits_per_min: 1.0 });
+            w.pending_objects.push_back(RoadsideObject::VelocitySign {
+                commits_per_min: 1.0,
+            });
         }
         w.update(0.016);
         let lanes: Vec<_> = w.active_objects.iter().map(|(l, _, _)| *l).collect();
@@ -312,15 +356,51 @@ mod tests {
     // --- WorldState::ingest_poll ---
 
     #[test]
-    fn test_ingest_poll_creates_billboard() {
+    fn test_ingest_poll_creates_commit_car() {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         let poll = poll_with_commit("fix bug", "Alice", 10, 5, 0.1);
         w.ingest_poll(&poll, &seed);
-        let has_billboard = w.pending_objects.iter().any(|o| {
-            matches!(o, RoadsideObject::CommitBillboard { .. })
+        let has_car = w
+            .pending_objects
+            .iter()
+            .any(|o| matches!(o, RoadsideObject::CommitCar { .. }));
+        assert!(has_car, "commit should produce CommitCar");
+    }
+
+    #[test]
+    fn test_lane_assignment_commit_car() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.pending_objects.push_back(RoadsideObject::CommitCar {
+            message: "test".to_string(),
+            author: "Alice".to_string(),
+            author_color: Rgba([100, 200, 100, 255]),
         });
-        assert!(has_billboard, "commit should produce CommitBillboard");
+        w.pending_objects.push_back(RoadsideObject::VelocitySign {
+            commits_per_min: 1.0,
+        });
+        w.update(0.016);
+        let car_lane = w
+            .active_objects
+            .iter()
+            .find(|(_, _, o)| matches!(o, RoadsideObject::CommitCar { .. }))
+            .map(|(l, _, _)| *l);
+        let sign_lane = w
+            .active_objects
+            .iter()
+            .find(|(_, _, o)| matches!(o, RoadsideObject::VelocitySign { .. }))
+            .map(|(l, _, _)| *l);
+        assert!(
+            car_lane == Some(objects::Lane::RoadLeft) || car_lane == Some(objects::Lane::RoadRight),
+            "CommitCar should be on road lane, got {:?}",
+            car_lane
+        );
+        assert!(
+            sign_lane == Some(objects::Lane::Left) || sign_lane == Some(objects::Lane::Right),
+            "VelocitySign should be on verge lane, got {:?}",
+            sign_lane
+        );
     }
 
     #[test]
@@ -329,9 +409,10 @@ mod tests {
         let mut w = WorldState::new(&seed);
         let poll = poll_with_commit("big feature", "Alice", 100, 0, 0.1);
         w.ingest_poll(&poll, &seed);
-        let has_tower = w.pending_objects.iter().any(|o| {
-            matches!(o, RoadsideObject::AdditionTower { .. })
-        });
+        let has_tower = w
+            .pending_objects
+            .iter()
+            .any(|o| matches!(o, RoadsideObject::AdditionTower { .. }));
         assert!(has_tower, ">50 lines_added should produce AdditionTower");
     }
 
@@ -341,10 +422,14 @@ mod tests {
         let mut w = WorldState::new(&seed);
         let poll = poll_with_commit("small fix", "Alice", 30, 0, 0.1);
         w.ingest_poll(&poll, &seed);
-        let has_tower = w.pending_objects.iter().any(|o| {
-            matches!(o, RoadsideObject::AdditionTower { .. })
-        });
-        assert!(!has_tower, "<=50 lines_added should not produce AdditionTower");
+        let has_tower = w
+            .pending_objects
+            .iter()
+            .any(|o| matches!(o, RoadsideObject::AdditionTower { .. }));
+        assert!(
+            !has_tower,
+            "<=50 lines_added should not produce AdditionTower"
+        );
     }
 
     #[test]
@@ -353,9 +438,10 @@ mod tests {
         let mut w = WorldState::new(&seed);
         let poll = poll_with_commit("cleanup", "Alice", 0, 80, 0.1);
         w.ingest_poll(&poll, &seed);
-        let has_shard = w.pending_objects.iter().any(|o| {
-            matches!(o, RoadsideObject::DeletionShard { .. })
-        });
+        let has_shard = w
+            .pending_objects
+            .iter()
+            .any(|o| matches!(o, RoadsideObject::DeletionShard { .. }));
         assert!(has_shard, ">50 lines_deleted should produce DeletionShard");
     }
 
@@ -366,15 +452,24 @@ mod tests {
         assert_eq!(w.tier, VelocityTier::Flatline);
         let poll = empty_poll(0.5); // Active tier
         w.ingest_poll(&poll, &seed);
-        let has_gate = w.active_objects.iter().any(|(_, _, o)| {
-            matches!(o, RoadsideObject::TierGate { .. })
-        });
-        assert!(has_gate, "tier change should spawn TierGate in active_objects");
+        let has_gate = w
+            .active_objects
+            .iter()
+            .any(|(_, _, o)| matches!(o, RoadsideObject::TierGate { .. }));
+        assert!(
+            has_gate,
+            "tier change should spawn TierGate in active_objects"
+        );
         // TierGate should be at camera_z + NEAR_SPAWN
-        let gate_z = w.active_objects.iter()
+        let gate_z = w
+            .active_objects
+            .iter()
             .find_map(|(_, z, o)| matches!(o, RoadsideObject::TierGate { .. }).then_some(*z))
             .unwrap();
-        assert!((gate_z - NEAR_SPAWN).abs() < 0.1, "TierGate should be at NEAR_SPAWN");
+        assert!(
+            (gate_z - NEAR_SPAWN).abs() < 0.1,
+            "TierGate should be at NEAR_SPAWN"
+        );
     }
 
     #[test]
@@ -388,14 +483,21 @@ mod tests {
 
         // Second poll: same cpm, same tier
         let poll2 = empty_poll(0.5);
-        let gates_before = w.active_objects.iter()
+        let gates_before = w
+            .active_objects
+            .iter()
             .filter(|(_, _, o)| matches!(o, RoadsideObject::TierGate { .. }))
             .count();
         w.ingest_poll(&poll2, &seed);
-        let gates_after = w.active_objects.iter()
+        let gates_after = w
+            .active_objects
+            .iter()
             .filter(|(_, _, o)| matches!(o, RoadsideObject::TierGate { .. }))
             .count();
-        assert_eq!(gates_after, gates_before, "same tier should not spawn another TierGate");
+        assert_eq!(
+            gates_after, gates_before,
+            "same tier should not spawn another TierGate"
+        );
     }
 
     #[test]

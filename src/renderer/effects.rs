@@ -334,6 +334,10 @@ mod tests {
             curve_offset: 0.0,
             curve_target: 0.0,
             steer_angle: 0.0,
+            speed_multiplier: 1.0,
+            curve_multiplier: 1.0,
+            speed_hold_time: 0.0,
+            curve_hold_time: 0.0,
         }
     }
 
@@ -538,7 +542,11 @@ mod tests {
         // Neighbors should have received additive glow.
         // Edge weight: 255 * 19 / 256 ≈ 18
         let neighbor = fb.get_pixel(3, 4);
-        assert!(neighbor.0[0] > 10, "neighbor should be brighter than original 10, got {}", neighbor.0[0]);
+        assert!(
+            neighbor.0[0] > 10,
+            "neighbor should be brighter than original 10, got {}",
+            neighbor.0[0]
+        );
     }
 
     #[test]
@@ -593,7 +601,10 @@ mod tests {
                 }
             }
         }
-        assert!(changed > 0, "speed lines should modify at least some pixels");
+        assert!(
+            changed > 0,
+            "speed lines should modify at least some pixels"
+        );
     }
 
     #[test]

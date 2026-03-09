@@ -1,6 +1,7 @@
 pub mod effects;
 pub mod font;
 pub mod hud;
+pub mod menu;
 pub mod road;
 pub mod sky;
 pub mod sprites;
@@ -23,8 +24,9 @@ pub struct FrameRenderer {
     pub dev: bool,
     frame_count: u64,
     last_render_us: u128,
-    actual_fps: f32,
-    target_fps: u32,
+    world_fps: f32,
+    render_fps: f32,
+    target_render_fps: u32,
     encode_send_us: u128,
 }
 
@@ -50,15 +52,23 @@ impl FrameRenderer {
             dev,
             frame_count: 0,
             last_render_us: 0,
-            actual_fps: 0.0,
-            target_fps: 0,
+            world_fps: 0.0,
+            render_fps: 0.0,
+            target_render_fps: 0,
             encode_send_us: 0,
         }
     }
 
-    pub fn set_timing(&mut self, actual_fps: f32, target_fps: u32, encode_send_us: u128) {
-        self.actual_fps = actual_fps;
-        self.target_fps = target_fps;
+    pub fn set_timing(
+        &mut self,
+        world_fps: f32,
+        render_fps: f32,
+        target_render_fps: u32,
+        encode_send_us: u128,
+    ) {
+        self.world_fps = world_fps;
+        self.render_fps = render_fps;
+        self.target_render_fps = target_render_fps;
         self.encode_send_us = encode_send_us;
     }
 
@@ -126,8 +136,9 @@ impl FrameRenderer {
                 seed,
                 self.frame_count,
                 self.last_render_us,
-                self.actual_fps,
-                self.target_fps,
+                self.world_fps,
+                self.render_fps,
+                self.target_render_fps,
                 self.encode_send_us,
             );
         }
