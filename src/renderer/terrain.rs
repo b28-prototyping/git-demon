@@ -1,194 +1,210 @@
 use image::{ImageBuffer, Rgba};
-use noise::{NoiseFn, OpenSimplex};
 
+use super::road_table::{self, RoadRow};
 use crate::git::seed::RepoSeed;
 use crate::world::WorldState;
 
-const TERRAIN_FREQ: f64 = 0.008;
-const TERRAIN_DRIFT: f64 = 0.3;
-const LEFT_SEED: u32 = 42;
-const RIGHT_SEED: u32 = 137;
-const TREE_SEED: u32 = 251;
+/// Parallax factor for terrain islands (near-background layer).
+/// Scroll at 40% of camera Z advancement.
+const ISLAND_PARALLAX: f32 = 0.4;
 
-const TERRAIN_LEFT_COLOR: Rgba<u8> = Rgba([8, 12, 20, 255]);
-const TERRAIN_RIGHT_COLOR: Rgba<u8> = Rgba([12, 14, 22, 255]);
+/// Parallax factor for clouds (mid-background layer).
+/// Scroll at 15% of camera Z advancement.
+const CLOUD_PARALLAX: f32 = 0.15;
 
-// Tree colors
-const TREE_TRUNK: Rgba<u8> = Rgba([25, 15, 10, 255]);
-const TREE_CANOPY_DARK: Rgba<u8> = Rgba([10, 30, 15, 255]);
-const TREE_CANOPY_LIGHT: Rgba<u8> = Rgba([15, 45, 20, 255]);
-
+/// Draw islands and clouds over the sea surface.
 pub fn draw_terrain(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     w: u32,
-    _h: u32,
+    h: u32,
     horizon_y: u32,
-    seed: &RepoSeed,
+    _seed: &RepoSeed,
     world: &WorldState,
+    rtable: &[RoadRow],
 ) {
-    let left_noise = OpenSimplex::new(LEFT_SEED);
-    let right_noise = OpenSimplex::new(RIGHT_SEED);
-    let tree_noise = OpenSimplex::new(TREE_SEED);
-    let max_terrain_h = (horizon_y as f32 * 0.6 * seed.terrain_roughness) as u32;
-
-    let road_left_edge = w / 4;
-    let road_right_edge = w * 3 / 4;
-
-    // Left terrain silhouette
-    for x in 0..road_left_edge {
-        let nx = x as f64 * TERRAIN_FREQ;
-        let ny = world.time as f64 * TERRAIN_DRIFT;
-        let val = left_noise.get([nx, ny]);
-        let h = ((val + 1.0) * 0.5 * max_terrain_h as f64) as u32;
-
-        let top = horizon_y.saturating_sub(h);
-        for y in top..horizon_y {
-            if x < fb.width() && y < fb.height() {
-                fb.put_pixel(x, y, TERRAIN_LEFT_COLOR);
-            }
-        }
-    }
-
-    // Right terrain silhouette
-    for x in road_right_edge..w {
-        let nx = x as f64 * TERRAIN_FREQ;
-        let ny = world.time as f64 * TERRAIN_DRIFT + 100.0;
-        let val = right_noise.get([nx, ny]);
-        let h = ((val + 1.0) * 0.5 * max_terrain_h as f64) as u32;
-
-        let top = horizon_y.saturating_sub(h);
-        for y in top..horizon_y {
-            if x < fb.width() && y < fb.height() {
-                fb.put_pixel(x, y, TERRAIN_RIGHT_COLOR);
-            }
-        }
-    }
-
-    // Trees on left side — procedural placement via noise threshold
-    draw_trees(fb, &tree_noise, 0, road_left_edge, horizon_y, world, true);
-    // Trees on right side
-    draw_trees(fb, &tree_noise, road_right_edge, w, horizon_y, world, false);
+    draw_islands(fb, w, h, horizon_y, world, rtable);
+    draw_clouds(fb, w, h, horizon_y, world, rtable);
 }
 
-fn draw_trees(
+/// Small islands on the ocean surface, scrolling with camera.
+fn draw_islands(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    noise: &OpenSimplex,
-    x_start: u32,
-    x_end: u32,
-    horizon_y: u32,
-    world: &WorldState,
-    left_side: bool,
-) {
-    // Place trees at intervals determined by noise
-    let tree_spacing = 40u32;
-    let offset = if left_side { 0.0 } else { 500.0 };
-    let scroll = (world.camera_z * 8.0) as i32; // trees scroll with camera
-
-    let range_w = x_end.saturating_sub(x_start);
-    if range_w < 20 {
-        return;
-    }
-
-    for i in 0..32 {
-        let base_x = i as f64 * tree_spacing as f64 + offset;
-        let noise_val = noise.get([base_x * 0.05, world.time as f64 * 0.01 + offset]);
-
-        // Only place tree if noise above threshold (sparse placement)
-        if noise_val < 0.1 {
-            continue;
-        }
-
-        let screen_x = ((base_x as i32 - scroll % (32 * tree_spacing as i32))
-            .rem_euclid(range_w as i32)) as u32
-            + x_start;
-
-        if screen_x >= x_end || screen_x < x_start {
-            continue;
-        }
-
-        // Tree depth: further from road edge = closer to horizon = smaller
-        let dist_from_road = if left_side {
-            (x_end - screen_x) as f32 / range_w as f32
-        } else {
-            (screen_x - x_start) as f32 / range_w as f32
-        };
-        let depth = dist_from_road.clamp(0.1, 1.0);
-
-        let trunk_h = (8.0 + depth * 20.0) as u32;
-        let trunk_w = (2.0 + depth * 3.0) as u32;
-        let canopy_r = (4.0 + depth * 12.0) as u32;
-
-        let base_y = horizon_y.saturating_sub((depth * 5.0) as u32);
-        let canopy_color = if noise_val > 0.4 {
-            TREE_CANOPY_LIGHT
-        } else {
-            TREE_CANOPY_DARK
-        };
-
-        // Trunk
-        draw_rect(
-            fb,
-            screen_x.saturating_sub(trunk_w / 2),
-            base_y.saturating_sub(trunk_h),
-            trunk_w,
-            trunk_h,
-            TREE_TRUNK,
-        );
-        // Canopy — simple filled triangle approximation (diamond shape)
-        let canopy_cx = screen_x;
-        let canopy_cy = base_y.saturating_sub(trunk_h + canopy_r / 2);
-        draw_diamond(fb, canopy_cx, canopy_cy, canopy_r, canopy_color);
-    }
-}
-
-fn draw_rect(
-    fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    x: u32,
-    y: u32,
     w: u32,
     h: u32,
-    color: Rgba<u8>,
+    horizon_y: u32,
+    world: &WorldState,
+    rtable: &[RoadRow],
 ) {
-    let fw = fb.width();
-    let fh = fb.height();
-    for dy in 0..h {
-        for dx in 0..w {
-            let px = x + dx;
-            let py = y + dy;
-            if px < fw && py < fh {
-                fb.put_pixel(px, py, color);
+    let island_count = 16u32;
+    let z_period = 4000.0_f32;
+    let cam = &world.camera;
+
+    for i in 0..island_count {
+        let hash = i.wrapping_mul(2654435761);
+        let hash2 = i.wrapping_mul(1664525).wrapping_add(1013904223);
+        let hash3 = i.wrapping_mul(214013).wrapping_add(2531011);
+
+        // World-Z: islands repeat in a cycle, scrolling at ISLAND_PARALLAX rate
+        let base_z = (hash as f32 / u32::MAX as f32) * z_period;
+        let parallax_z = world.camera_z * ISLAND_PARALLAX;
+        let z_rel = ((base_z - (parallax_z % z_period)) + z_period) % z_period;
+        let z_world = world.camera.z + z_rel;
+
+        // Project using Camera (1/z)
+        let Some((sy, depth_scale)) = cam.project(z_world, h, horizon_y) else {
+            continue;
+        };
+        if depth_scale < 0.005 {
+            continue;
+        }
+
+        let pitch_shift = cam.pitch_offset(ISLAND_PARALLAX, h);
+        let screen_y = (sy + pitch_shift) as i32;
+        if screen_y < horizon_y as i32 || screen_y >= h as i32 {
+            continue;
+        }
+
+        // Use road table for per-segment curve offset; apply slope to surface items
+        let (curve_off, slope_off) = if let Some((curve, slope, _)) =
+            road_table::lookup_at_z(rtable, z_world, world.camera_z, horizon_y)
+        {
+            (curve * depth_scale * depth_scale, slope)
+        } else {
+            (world.curve_offset * depth_scale * depth_scale, 0.0)
+        };
+
+        // Lateral position — spread across screen
+        let world_x = (hash2 as f32 / u32::MAX as f32 - 0.5) * 600.0;
+        let cx = w as f32 / 2.0 + curve_off;
+        let spread = cam.road_half(depth_scale) * 1.5;
+        let screen_x = (cx + world_x * spread / 300.0) as i32;
+
+        // Apply slope offset — islands sit on the road surface
+        let screen_y = screen_y + slope_off as i32;
+        if screen_y < horizon_y as i32 || screen_y >= h as i32 {
+            continue;
+        }
+
+        // Island size scales with perspective
+        let size_x = (12.0 + depth_scale * 18.0) as i32;
+        let size_y = (4.0 + depth_scale * 6.0) as i32;
+
+        // Island colors — sandy brown to lush green
+        let green_var = (hash3 % 40) as u8;
+        let island_color = Rgba([15 + green_var / 3, 40 + green_var, 20 + green_var / 2, 255]);
+        let sand_color = Rgba([50 + green_var, 45 + green_var / 2, 25, 255]);
+
+        // Draw sandy ring
+        for dy in -(size_y + 1)..=(size_y + 1) {
+            let row_half = (size_x + 2) * ((size_y + 1) - dy.abs()) / (size_y + 1).max(1);
+            for dx in -row_half..=row_half {
+                let px = screen_x + dx;
+                let py = screen_y + dy;
+                if px >= 0 && py >= horizon_y as i32 && (px as u32) < w && (py as u32) < h {
+                    fb.put_pixel(px as u32, py as u32, sand_color);
+                }
+            }
+        }
+
+        // Draw green interior
+        for dy in -size_y..=size_y {
+            let row_half = size_x * (size_y - dy.abs()) / size_y.max(1);
+            for dx in -row_half..=row_half {
+                let px = screen_x + dx;
+                let py = screen_y + dy;
+                if px >= 0 && py >= horizon_y as i32 && (px as u32) < w && (py as u32) < h {
+                    fb.put_pixel(px as u32, py as u32, island_color);
+                }
             }
         }
     }
 }
 
-fn draw_diamond(
+/// Semi-transparent clouds floating between the ship and the sea.
+fn draw_clouds(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    cx: u32,
-    cy: u32,
-    r: u32,
-    color: Rgba<u8>,
+    w: u32,
+    h: u32,
+    horizon_y: u32,
+    world: &WorldState,
+    rtable: &[RoadRow],
 ) {
-    let fw = fb.width();
-    let fh = fb.height();
-    for dy in 0..=r {
-        let half_w = r.saturating_sub(dy);
-        for dx in 0..=half_w {
-            // Top half
-            let ty = cy.saturating_sub(dy);
-            if cx + dx < fw && ty < fh {
-                fb.put_pixel(cx + dx, ty, color);
-            }
-            if dx > 0 && cx >= dx && cx - dx < fw && ty < fh {
-                fb.put_pixel(cx - dx, ty, color);
-            }
-            // Bottom half
-            let by = cy + dy;
-            if cx + dx < fw && by < fh {
-                fb.put_pixel(cx + dx, by, color);
-            }
-            if dx > 0 && cx >= dx && cx - dx < fw && by < fh {
-                fb.put_pixel(cx - dx, by, color);
+    let cloud_count = 20u32;
+    let z_period = 5000.0_f32;
+    let cam = &world.camera;
+    let road_rows = (h - horizon_y).max(1) as f32;
+
+    for i in 0..cloud_count {
+        let hash = i.wrapping_mul(3266489917);
+        let hash2 = i.wrapping_mul(668265263).wrapping_add(374761393);
+        let hash3 = i.wrapping_mul(1103515245).wrapping_add(12345);
+
+        // World-Z: clouds cycle, scrolling at CLOUD_PARALLAX rate
+        let base_z = (hash as f32 / u32::MAX as f32) * z_period;
+        let parallax_z = world.camera_z * CLOUD_PARALLAX;
+        let z_rel = ((base_z - (parallax_z % z_period)) + z_period) % z_period;
+        let z_world = world.camera.z + z_rel;
+
+        // Project using Camera (1/z)
+        let Some((_, depth_scale)) = cam.project(z_world, h, horizon_y) else {
+            continue;
+        };
+        if depth_scale < 0.005 {
+            continue;
+        }
+
+        // Clouds sit higher than sea surface — between horizon and ship
+        // Map into the upper portion of the below-horizon area
+        let cloud_altitude = 0.3 + (hash3 as f32 / u32::MAX as f32) * 0.4; // 0.3..0.7
+        let pitch_shift = cam.pitch_offset(CLOUD_PARALLAX, h);
+        let screen_y =
+            (horizon_y as f32 + depth_scale * road_rows * cloud_altitude + pitch_shift) as i32;
+        if screen_y < horizon_y as i32 || screen_y >= h as i32 {
+            continue;
+        }
+
+        // Use road table for per-segment curve (clouds don't use slope — they float)
+        let curve_off = if let Some((curve, _, _)) =
+            road_table::lookup_at_z(rtable, z_world, world.camera_z, horizon_y)
+        {
+            curve * depth_scale * depth_scale
+        } else {
+            world.curve_offset * depth_scale * depth_scale
+        };
+
+        // Lateral position
+        let world_x = (hash2 as f32 / u32::MAX as f32 - 0.5) * 800.0;
+        let cx = w as f32 / 2.0 + curve_off;
+        let spread = cam.road_half(depth_scale) * 1.5;
+        let screen_x = (cx + world_x * spread / 400.0) as i32;
+
+        // Cloud size — wider than tall, scales with perspective
+        let size_x = (20.0 + depth_scale * 40.0) as i32;
+        let size_y = (5.0 + depth_scale * 10.0) as i32;
+
+        // Semi-transparent white — uniform alpha, no per-pixel fade
+        let alpha = (depth_scale * 70.0) as u32;
+        let inv = 255 - alpha;
+        let brightness = (200 + hash % 55).min(255);
+
+        for dy in -size_y..=size_y {
+            let row_half = size_x * (size_y - dy.abs()) / size_y.max(1);
+            for dx in -row_half..=row_half {
+                let px = screen_x + dx;
+                let py = screen_y + dy;
+                if px >= 0 && py >= horizon_y as i32 && (px as u32) < w && (py as u32) < h {
+                    let bg = fb.get_pixel(px as u32, py as u32);
+                    fb.put_pixel(
+                        px as u32,
+                        py as u32,
+                        Rgba([
+                            ((brightness * alpha + bg.0[0] as u32 * inv) / 255) as u8,
+                            ((brightness * alpha + bg.0[1] as u32 * inv) / 255) as u8,
+                            ((brightness * alpha + bg.0[2] as u32 * inv) / 255) as u8,
+                            255,
+                        ]),
+                    );
+                }
             }
         }
     }
@@ -199,11 +215,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_seed(terrain_roughness: f32) -> RepoSeed {
+    fn make_seed() -> RepoSeed {
         RepoSeed {
             accent_hue: 200.0,
             saturation: 0.8,
-            terrain_roughness,
+            terrain_roughness: 0.5,
             speed_base: 0.5,
             author_colors: HashMap::new(),
             total_commits: 100,
@@ -211,235 +227,175 @@ mod tests {
         }
     }
 
-    fn make_world(time: f32, seed: &RepoSeed) -> WorldState {
-        let mut w = WorldState::new(seed);
-        w.time = time;
-        w
-    }
-
     #[test]
-    fn test_left_right_different_noise() {
-        let seed = make_seed(0.8);
-        let world = make_world(5.0, &seed);
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
-        let mut fb = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb, w, h, horizon_y, &seed, &world);
-
-        // Collect terrain top for a left column and a right column
-        let left_x = 10u32;
-        let right_x = 170u32;
-
-        let left_top = (0..horizon_y).find(|&y| *fb.get_pixel(left_x, y) == TERRAIN_LEFT_COLOR);
-        let right_top = (0..horizon_y).find(|&y| *fb.get_pixel(right_x, y) == TERRAIN_RIGHT_COLOR);
-
-        // Both sides should have terrain
-        assert!(left_top.is_some(), "left terrain should be present");
-        assert!(right_top.is_some(), "right terrain should be present");
-        // They should differ (different seeds produce different heights)
-        assert_ne!(
-            left_top, right_top,
-            "left and right terrain should have different profiles"
-        );
-    }
-
-    #[test]
-    fn test_roughness_scales_height() {
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
-
-        let seed_low = make_seed(0.1);
-        let world_low = make_world(3.0, &seed_low);
-        let mut fb_low = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb_low, w, h, horizon_y, &seed_low, &world_low);
-
-        let seed_high = make_seed(1.0);
-        let world_high = make_world(3.0, &seed_high);
-        let mut fb_high = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb_high, w, h, horizon_y, &seed_high, &world_high);
-
-        // Find highest terrain pixel (lowest y) across all left columns
-        let highest_low = (0..w / 4)
-            .filter_map(|x| (0..horizon_y).find(|&y| *fb_low.get_pixel(x, y) == TERRAIN_LEFT_COLOR))
-            .min();
-        let highest_high = (0..w / 4)
-            .filter_map(|x| {
-                (0..horizon_y).find(|&y| *fb_high.get_pixel(x, y) == TERRAIN_LEFT_COLOR)
-            })
-            .min();
-
-        assert!(highest_low.is_some() && highest_high.is_some());
-        // Higher roughness should produce taller terrain (lower y value)
-        assert!(
-            highest_high.unwrap() < highest_low.unwrap(),
-            "roughness=1.0 should produce taller terrain than roughness=0.1 (got {} vs {})",
-            highest_high.unwrap(),
-            highest_low.unwrap()
-        );
-    }
-
-    #[test]
-    fn test_silhouette_filled() {
-        let seed = make_seed(0.8);
-        let world = make_world(2.0, &seed);
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
-        let mut fb = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb, w, h, horizon_y, &seed, &world);
-
-        // Check a left terrain column: all pixels from top to horizon should be filled
-        let x = 15u32;
-        if let Some(top) = (0..horizon_y).find(|&y| *fb.get_pixel(x, y) == TERRAIN_LEFT_COLOR) {
-            for y in top..horizon_y {
-                assert_eq!(
-                    *fb.get_pixel(x, y),
-                    TERRAIN_LEFT_COLOR,
-                    "gap in left silhouette at ({x}, {y})"
-                );
-            }
-        }
-
-        // Check a right terrain column
-        let x = 175u32;
-        if let Some(top) = (0..horizon_y).find(|&y| *fb.get_pixel(x, y) == TERRAIN_RIGHT_COLOR) {
-            for y in top..horizon_y {
-                assert_eq!(
-                    *fb.get_pixel(x, y),
-                    TERRAIN_RIGHT_COLOR,
-                    "gap in right silhouette at ({x}, {y})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_colors_match() {
-        let seed = make_seed(0.8);
-        let world = make_world(1.0, &seed);
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
-        let mut fb = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb, w, h, horizon_y, &seed, &world);
-
+    fn test_draw_terrain_modifies_pixels() {
+        let seed = make_seed();
+        let mut world = WorldState::new(&seed);
+        world.camera_z = 100.0;
+        world.camera.z = 100.0;
+        let (w, h) = (400, 200);
         let transparent = Rgba([0, 0, 0, 0]);
+        let mut fb = ImageBuffer::from_pixel(w, h, transparent);
 
-        // Left terrain should only contain TERRAIN_LEFT_COLOR (or black/tree colors)
-        for x in 0..w / 4 {
-            for y in 0..horizon_y {
-                let px = *fb.get_pixel(x, y);
-                if px != transparent && px != TERRAIN_LEFT_COLOR {
-                    // Could be tree pixels — they're valid too
-                    assert!(
-                        px == TREE_TRUNK || px == TREE_CANOPY_DARK || px == TREE_CANOPY_LIGHT,
-                        "unexpected color in left terrain at ({x},{y}): {px:?}"
-                    );
-                }
-            }
-        }
+        draw_terrain(&mut fb, w, h, 50, &seed, &world, &[]);
 
-        // Right terrain
-        for x in (w * 3 / 4)..w {
-            for y in 0..horizon_y {
-                let px = *fb.get_pixel(x, y);
-                if px != transparent && px != TERRAIN_RIGHT_COLOR {
-                    assert!(
-                        px == TREE_TRUNK || px == TREE_CANOPY_DARK || px == TREE_CANOPY_LIGHT,
-                        "unexpected color in right terrain at ({x},{y}): {px:?}"
-                    );
-                }
-            }
-        }
+        let changed = fb.pixels().filter(|p| **p != transparent).count();
+        assert!(
+            changed > 0,
+            "terrain (islands/clouds) should modify some pixels"
+        );
     }
 
     #[test]
-    fn test_time_drift() {
-        let seed = make_seed(0.6);
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
+    fn test_draw_terrain_stays_below_horizon() {
+        let seed = make_seed();
+        let mut world = WorldState::new(&seed);
+        world.camera_z = 500.0;
+        world.camera.z = 500.0;
+        let (w, h) = (400, 200);
+        let horizon_y = 50u32;
+        let transparent = Rgba([0, 0, 0, 0]);
+        let mut fb = ImageBuffer::from_pixel(w, h, transparent);
 
-        let world_a = make_world(0.0, &seed);
-        let mut fb_a = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb_a, w, h, horizon_y, &seed, &world_a);
+        draw_terrain(&mut fb, w, h, horizon_y, &seed, &world, &[]);
 
-        let world_b = make_world(10.0, &seed);
-        let mut fb_b = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb_b, w, h, horizon_y, &seed, &world_b);
-
-        // At least some terrain pixels should differ between the two times
-        let mut differs = false;
-        for x in 0..w / 4 {
-            for y in 0..horizon_y {
-                if fb_a.get_pixel(x, y) != fb_b.get_pixel(x, y) {
-                    differs = true;
-                    break;
-                }
-            }
-            if differs {
-                break;
-            }
-        }
-        assert!(differs, "terrain should change over time due to drift");
-    }
-
-    #[test]
-    fn test_no_terrain_below_horizon() {
-        let seed = make_seed(1.0);
-        let world = make_world(0.0, &seed);
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
-        let mut fb = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb, w, h, horizon_y, &seed, &world);
-
-        for x in 0..w {
-            for y in horizon_y..h {
+        for y in 0..horizon_y {
+            for x in 0..w {
                 assert_eq!(
                     *fb.get_pixel(x, y),
-                    Rgba([0, 0, 0, 0]),
-                    "terrain pixel found below horizon at ({x}, {y})"
+                    transparent,
+                    "no terrain pixels above horizon at ({x},{y})"
                 );
             }
         }
     }
 
     #[test]
-    fn test_terrain_boundaries() {
-        let seed = make_seed(0.8);
-        let world = make_world(1.0, &seed);
-        let (w, h) = (200, 100);
-        let horizon_y = 50;
-        let mut fb = ImageBuffer::new(w, h);
-        draw_terrain(&mut fb, w, h, horizon_y, &seed, &world);
+    fn test_islands_scroll_with_camera() {
+        let seed = make_seed();
+        let (w, h) = (400, 200);
+        let horizon_y = 50u32;
 
-        // Middle band (between road edges) should have no terrain colors
-        for x in (w / 4)..(w * 3 / 4) {
-            for y in 0..horizon_y {
-                let px = *fb.get_pixel(x, y);
-                assert!(
-                    px != TERRAIN_LEFT_COLOR && px != TERRAIN_RIGHT_COLOR,
-                    "terrain color found in middle band at ({x}, {y})"
-                );
-            }
-        }
+        let render = |cam_z: f32| -> Vec<u8> {
+            let mut world = WorldState::new(&seed);
+            world.camera_z = cam_z;
+            world.camera.z = cam_z;
+            let transparent = Rgba([0, 0, 0, 0]);
+            let mut fb = ImageBuffer::from_pixel(w, h, transparent);
+            draw_islands(&mut fb, w, h, horizon_y, &world, &[]);
+            fb.into_raw()
+        };
+
+        let a = render(0.0);
+        let b = render(500.0);
+        assert_ne!(a, b, "islands should shift as camera moves");
     }
 
     #[test]
-    fn test_zero_horizon_safe() {
-        let seed = make_seed(0.5);
-        let world = make_world(0.0, &seed);
-        let (w, h) = (200, 100);
-        let mut fb = ImageBuffer::new(w, h);
-        // Should not panic with horizon_y = 0
-        draw_terrain(&mut fb, w, h, 0, &seed, &world);
+    fn test_islands_parallax_rate() {
+        // Islands scroll at 40% of camera_z. Moving camera_z by X should
+        // produce the same island layout as moving by X/0.4 at full rate.
+        // Equivalently: camera_z=1000 should look the same as camera_z=2500*0.4=1000.
+        let seed = make_seed();
+        let (w, h) = (400, 200);
+        let horizon_y = 50u32;
 
-        // No terrain silhouette pixels should be written (trees may still render)
-        for x in 0..w {
-            for y in 0..h {
-                let px = *fb.get_pixel(x, y);
-                assert!(
-                    px != TERRAIN_LEFT_COLOR && px != TERRAIN_RIGHT_COLOR,
-                    "terrain silhouette pixel found at ({x}, {y}) with horizon_y=0"
-                );
-            }
-        }
+        let render = |cam_z: f32| -> Vec<u8> {
+            let mut world = WorldState::new(&seed);
+            world.camera_z = cam_z;
+            world.camera.z = cam_z;
+            let transparent = Rgba([0, 0, 0, 0]);
+            let mut fb = ImageBuffer::from_pixel(w, h, transparent);
+            draw_islands(&mut fb, w, h, horizon_y, &world, &[]);
+            fb.into_raw()
+        };
+
+        // At camera_z=0 and camera_z=1000, islands should differ
+        let at_0 = render(0.0);
+        let at_1000 = render(1000.0);
+        assert_ne!(at_0, at_1000, "islands should differ at different camera_z");
+
+        // The parallax cycle length is z_period / ISLAND_PARALLAX = 4000 / 0.4 = 10000.
+        // So at camera_z=10000 the island layout should wrap back to camera_z=0.
+        let at_cycle = render(10000.0);
+        assert_eq!(
+            at_0, at_cycle,
+            "islands should repeat after full parallax cycle"
+        );
+    }
+
+    #[test]
+    fn test_clouds_scroll_slower_than_islands() {
+        // Render at two camera_z values. Count changed pixels for islands vs clouds.
+        // Clouds (0.15) should change less than islands (0.4) for the same camera_z delta.
+        let seed = make_seed();
+        let (w, h) = (400, 200);
+        let horizon_y = 50u32;
+
+        let render_islands = |cam_z: f32| -> Vec<u8> {
+            let mut world = WorldState::new(&seed);
+            world.camera_z = cam_z;
+            world.camera.z = cam_z;
+            let transparent = Rgba([0, 0, 0, 0]);
+            let mut fb = ImageBuffer::from_pixel(w, h, transparent);
+            draw_islands(&mut fb, w, h, horizon_y, &world, &[]);
+            fb.into_raw()
+        };
+
+        let render_clouds = |cam_z: f32| -> Vec<u8> {
+            let mut world = WorldState::new(&seed);
+            world.camera_z = cam_z;
+            world.camera.z = cam_z;
+            let transparent = Rgba([0, 0, 0, 0]);
+            let mut fb = ImageBuffer::from_pixel(w, h, transparent);
+            draw_clouds(&mut fb, w, h, horizon_y, &world, &[]);
+            fb.into_raw()
+        };
+
+        let island_diff = render_islands(0.0)
+            .iter()
+            .zip(render_islands(200.0).iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        let cloud_diff = render_clouds(0.0)
+            .iter()
+            .zip(render_clouds(200.0).iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        // Both should have some difference
+        assert!(island_diff > 0, "islands should change with camera_z");
+        assert!(cloud_diff > 0, "clouds should change with camera_z");
+        // Clouds should change less since they scroll slower
+        assert!(
+            cloud_diff < island_diff,
+            "clouds ({cloud_diff} changed bytes) should change less than islands ({island_diff})"
+        );
+    }
+
+    #[test]
+    fn test_pitch_offset_shifts_terrain() {
+        let seed = make_seed();
+        let (w, h) = (400, 200);
+        let horizon_y = 50u32;
+
+        let render = |pitch: f32| -> Vec<u8> {
+            let mut world = WorldState::new(&seed);
+            world.camera_z = 100.0;
+            world.camera.z = 100.0;
+            world.camera.pitch = pitch;
+            let transparent = Rgba([0, 0, 0, 0]);
+            let mut fb = ImageBuffer::from_pixel(w, h, transparent);
+            draw_terrain(&mut fb, w, h, horizon_y, &seed, &world, &[]);
+            fb.into_raw()
+        };
+
+        let no_pitch = render(0.0);
+        let with_pitch = render(0.2);
+        assert_ne!(
+            no_pitch, with_pitch,
+            "pitch should shift terrain layer positions"
+        );
     }
 }
