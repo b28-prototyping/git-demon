@@ -9,7 +9,7 @@ dev:
 
 # Run in release mode, full resolution, max performance
 start *ARGS:
-    cargo run --release -- --repo . --fps 30 --render-fps 15 --scale 1 {{ARGS}}
+    cargo run --release -- --repo . --fps 30 --render-fps 15 --scale 1 --no-blur --no-bloom {{ARGS}}
 
 # Single run without watch
 run *ARGS:
@@ -26,5 +26,5 @@ _commit-agent:
     #!/usr/bin/env bash
     set -euo pipefail
     exec claude \
-      --allowedTools 'Read,Write,Glob,Grep,Bash(git status*),Bash(git diff*),Bash(git log*),Bash(git add *),Bash(git commit *),Bash(git push *),Bash(lisa status),Bash(lisa validate),Bash(cargo test*),Bash(cargo fmt*),Bash(cargo clippy*),Edit' \
+      --dangerously-skip-permissions \
       -- "$(cat .just/prompts/commit-agent.md)"

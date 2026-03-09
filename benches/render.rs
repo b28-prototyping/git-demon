@@ -222,8 +222,8 @@ fn bench_road(c: &mut Criterion) {
 
     c.bench_function("pass/road", |b| {
         b.iter(|| {
-            git_demon::renderer::road::draw_road(&mut fb, W, H, horizon_y, &world, &seed);
-            git_demon::renderer::road::draw_grid(&mut fb, W, H, horizon_y, &world, &seed);
+            git_demon::renderer::road::draw_road(&mut fb, W, H, horizon_y, &world, &seed, &[]);
+            git_demon::renderer::road::draw_grid(&mut fb, W, H, horizon_y, &world, &seed, &[]);
             std::hint::black_box(&fb);
         });
     });
