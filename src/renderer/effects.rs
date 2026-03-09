@@ -6,39 +6,75 @@ use crate::world::WorldState;
 const BLOOM_THRESHOLD: f32 = 0.72;
 const _BLOOM_STRENGTH: f32 = 0.3;
 
+/// Draw star-field speed streaks radiating from the vanishing point.
+/// At low speed: sparse dim dots. At high speed: long bright streaks
+/// like the Millennium Falcon entering hyperspace.
 pub fn draw_speed_lines(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     w: u32,
-    horizon_y: u32,
+    _horizon_y: u32,
     world: &WorldState,
     seed: &RepoSeed,
 ) {
-    let n = ((world.commits_per_min * 8.0) as u32).min(64);
-    if n == 0 {
+    let h = fb.height();
+    let (cx, cy) = world.camera.vanishing_point(w, h);
+
+    // Speed factor: 0.0 at rest, 1.0 at max base speed
+    let speed_t = (world.speed / 300.0).clamp(0.0, 1.0);
+
+    // Number of streaks scales with speed and activity
+    // Only draw when there's meaningful speed
+    if speed_t < 0.01 && world.commits_per_min < 0.01 {
         return;
     }
-    let cx = w as f32 / 2.0;
-    let cy = horizon_y as f32;
-    let alpha = if world.tier as u8 >= 4 { 140u8 } else { 80u8 };
-    let accent = hue_to_rgb(seed.accent_hue);
-    let color = Rgba([accent.0, accent.1, accent.2, alpha]);
+    let base_n = world.commits_per_min * 12.0;
+    let n = ((base_n + speed_t * 100.0) as u32).clamp(10, 120);
 
-    let h = fb.height();
-    let max_len = (w as f32).hypot(h as f32) as u32;
+    let accent = hue_to_rgb(seed.accent_hue);
+
+    // Streak length scales with speed: short dots → long trails
+    // Distances proportional to screen diagonal so it works at any resolution
+    let diag = (w as f32).hypot(h as f32);
+    let min_start = diag * (0.05 + (1.0 - speed_t) * 0.1);
+    let max_len_f = diag * (0.05 + speed_t * 0.5);
+    let alpha_base = (60.0 + speed_t * 140.0) as u8;
+
+    // Use a deterministic hash for stable star positions
+    let time_phase = (world.time * 2.0) as u32;
 
     for i in 0..n {
-        let angle = (i as f32 / n as f32) * std::f32::consts::TAU;
+        // Pseudo-random angle and offset per streak, slowly rotating
+        let hash = (i.wrapping_mul(2654435761)).wrapping_add(time_phase.wrapping_mul(17));
+        let angle = (hash as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+        let offset_frac = (hash >> 8) as f32 / (u32::MAX >> 8) as f32;
+
         let dx = angle.cos();
         let dy = angle.sin();
 
-        // Step by 2 for performance — speed lines don't need pixel-perfect coverage
+        // Each streak starts at a random distance from center
+        let start = min_start + offset_frac * min_start * 2.0;
+        let streak_len = (max_len_f * (0.3 + offset_frac * 0.7)) as u32;
+
+        // Fade alpha along streak: bright at start, dim at end
         let mut step = 0u32;
-        while step < max_len {
-            let px = (cx + dx * step as f32) as i32;
-            let py = (cy + dy * step as f32) as i32;
+        while step < streak_len {
+            let dist = start + step as f32;
+            let px = (cx + dx * dist) as i32;
+            let py = (cy + dy * dist) as i32;
             if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
                 break;
             }
+
+            // Alpha fades along the streak
+            let fade = 1.0 - (step as f32 / streak_len as f32);
+            let a = (alpha_base as f32 * fade) as u8;
+            // Color: white core at high speed, accent tint at low speed
+            let white_mix = speed_t * 0.7;
+            let r = (accent.0 as f32 * (1.0 - white_mix) + 255.0 * white_mix) as u8;
+            let g = (accent.1 as f32 * (1.0 - white_mix) + 255.0 * white_mix) as u8;
+            let b = (accent.2 as f32 * (1.0 - white_mix) + 255.0 * white_mix) as u8;
+            let color = Rgba([r, g, b, a]);
+
             let pu = px as u32;
             let pv = py as u32;
             let bg = fb.get_pixel(pu, pv);
@@ -141,134 +177,191 @@ pub fn apply_bloom(fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>) {
     }
 }
 
-/// Draw the player car at the bottom center of the screen
+/// Draw the player ship centered on screen.
+/// Camera tracks the ship — it stays centered, the world moves around it.
+/// Nose points in the direction of travel.
 pub fn draw_car(fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, w: u32, h: u32, world: &WorldState) {
+    // Camera tracks the ship: no lateral offset
     let cx = w as f32 / 2.0;
-    // Slight lateral shift with steering
-    let steer_shift = world.steer_angle * 0.15;
-    let car_cx = (cx + steer_shift) as i32;
-    let car_bottom = h as i32 - 4;
+    // Hover above the sea — 42% gives vertical space below
+    let cy = h as f32 * 0.42;
 
-    // Car dimensions
-    let car_w = 60i32;
-    let car_h = 30i32;
-    let nose_h = 12i32;
+    // Real heading angle: nose points where we're going
+    let heading = (world.steer_angle * 0.012).clamp(-0.5, 0.5);
+    let cos_b = heading.cos();
+    let sin_b = heading.sin();
 
-    // Shadow — dark ellipse under the car, offset down slightly
-    let shadow_y = car_bottom + 2;
-    let shadow_rx = car_w / 2 + 8;
-    let shadow_ry = 6i32;
+    // Helper: rotate point around ship center and plot
+    let plot = |fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, dx: f32, dy: f32, color: Rgba<u8>| {
+        let rx = dx * cos_b - dy * sin_b;
+        let ry = dx * sin_b + dy * cos_b;
+        let px = (cx + rx) as i32;
+        let py = (cy + ry) as i32;
+        if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+            fb.put_pixel(px as u32, py as u32, color);
+        }
+    };
+
+    // Helper: plot with darkening for shadow
+    let plot_darken = |fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, dx: f32, dy: f32| {
+        let rx = dx * cos_b - dy * sin_b;
+        let ry = dx * sin_b + dy * cos_b;
+        let px = (cx + rx) as i32;
+        let py = (cy + ry) as i32;
+        if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+            let bg = fb.get_pixel(px as u32, py as u32);
+            fb.put_pixel(
+                px as u32,
+                py as u32,
+                Rgba([bg.0[0] / 2, bg.0[1] / 2, bg.0[2] / 2, 255]),
+            );
+        }
+    };
+
+    // Ship colors
+    let hull = Rgba([40, 65, 90, 255]);
+    let hull_light = Rgba([55, 85, 115, 255]);
+    let wing_color = Rgba([25, 45, 65, 255]);
+    let cockpit_color = Rgba([20, 35, 55, 255]);
+    let engine_glow = Rgba([0, 200, 255, 255]);
+    let engine_hot = Rgba([120, 230, 255, 255]);
+
+    // Shadow ellipse beneath ship
+    let shadow_rx = 38i32;
+    let shadow_ry = 5i32;
     for dy in -shadow_ry..=shadow_ry {
-        let row_half = shadow_rx * (shadow_ry - dy.abs()) / shadow_ry.max(1);
-        for dx in -row_half..=row_half {
-            let px = (car_cx + dx) as u32;
-            let py = (shadow_y + dy) as u32;
-            if px < w && py < h {
-                let bg = fb.get_pixel(px, py);
-                // Darken by 50%
-                fb.put_pixel(px, py, Rgba([bg.0[0] / 2, bg.0[1] / 2, bg.0[2] / 2, 255]));
-            }
+        let hw = shadow_rx * (shadow_ry - dy.abs()) / shadow_ry.max(1);
+        for dx in -hw..=hw {
+            plot_darken(fb, dx as f32, 4.0 + dy as f32);
         }
     }
 
-    // Body colors
-    let body_top = Rgba([180, 20, 20, 255]); // bright red
-    let body_mid = Rgba([140, 15, 15, 255]); // darker red
-    let body_dark = Rgba([80, 8, 8, 255]); // shadow side
-    let windshield = Rgba([40, 60, 90, 255]); // dark blue glass
-    let cockpit = Rgba([20, 20, 25, 255]); // dark interior
-
-    // Main body — trapezoid: wider at back, narrower at front
-    let body_top_y = car_bottom - car_h;
-    for dy in 0..car_h {
-        let t = dy as f32 / car_h as f32; // 0=top, 1=bottom
-        let half_w = ((car_w as f32 / 2.0) * (0.5 + t * 0.5)) as i32;
-        let color = if t < 0.3 {
-            body_top
-        } else if t < 0.7 {
-            body_mid
-        } else {
-            body_dark
-        };
-
-        for dx in -half_w..=half_w {
-            let px = (car_cx + dx) as u32;
-            let py = (body_top_y + dy) as u32;
-            if px < w && py < h {
-                fb.put_pixel(px, py, color);
-            }
+    // Fuselage — elongated arrow body
+    let nose = -28i32;
+    let tail = 8i32;
+    let body_half = 7i32;
+    for dy in nose..tail {
+        let t = (dy - nose) as f32 / (tail - nose) as f32;
+        let hw = (body_half as f32 * (0.15 + t * 0.85)) as i32;
+        let color = if t < 0.35 { hull_light } else { hull };
+        for dx in -hw..=hw {
+            plot(fb, dx as f32, dy as f32, color);
         }
     }
 
-    // Nose/wedge — triangle pointing forward (up), narrower
-    let nose_top_y = body_top_y - nose_h;
-    for dy in 0..nose_h {
-        let t = dy as f32 / nose_h as f32; // 0=tip, 1=body join
-        let half_w = ((car_w as f32 / 2.0) * 0.5 * (0.2 + t * 0.8)) as i32;
-        let color = if t < 0.5 { body_top } else { body_mid };
-
-        for dx in -half_w..=half_w {
-            let px = (car_cx + dx) as u32;
-            let py = (nose_top_y + dy) as u32;
-            if px < w && py < h {
-                fb.put_pixel(px, py, color);
-            }
+    // Delta wings — swept back from mid-body
+    let wing_start = -10i32;
+    let wing_end = 6i32;
+    let wing_span = 30i32;
+    for dy in wing_start..wing_end {
+        let t = (dy - wing_start) as f32 / (wing_end - wing_start) as f32;
+        let span = (wing_span as f32 * t) as i32;
+        for dx in body_half..(body_half + span) {
+            plot(fb, dx as f32, dy as f32, wing_color);
+            plot(fb, -(dx as f32), dy as f32, wing_color);
         }
     }
 
-    // Windshield — small dark area at top of main body
-    let ws_top = body_top_y + 2;
-    let ws_h = 6i32;
-    for dy in 0..ws_h {
-        let t = (dy as f32 / ws_h as f32 + 0.3).min(1.0);
-        let half_w = ((car_w as f32 / 2.0) * 0.35 * t) as i32;
-        for dx in -half_w..=half_w {
-            let px = (car_cx + dx) as u32;
-            let py = (ws_top + dy) as u32;
-            if px < w && py < h {
-                fb.put_pixel(px, py, windshield);
-            }
+    // Cockpit canopy
+    for dy in (nose + 4)..(nose + 14) {
+        let t = (dy - nose - 4) as f32 / 10.0;
+        let hw = (body_half as f32 * 0.5 * (0.2 + t * 0.8)) as i32;
+        for dx in -hw..=hw {
+            plot(fb, dx as f32, dy as f32, cockpit_color);
         }
     }
 
-    // Cockpit opening behind windshield
-    let cp_top = ws_top + ws_h;
-    let cp_h = 4i32;
-    for dy in 0..cp_h {
-        let half_w = ((car_w as f32 / 2.0) * 0.25) as i32;
-        for dx in -half_w..=half_w {
-            let px = (car_cx + dx) as u32;
-            let py = (cp_top + dy) as u32;
-            if px < w && py < h {
-                fb.put_pixel(px, py, cockpit);
-            }
+    // Engine exhaust glow
+    for dx in -5i32..=5 {
+        for dy in tail..(tail + 5) {
+            let t = (dy - tail) as f32 / 5.0;
+            let color = if t < 0.4 { engine_hot } else { engine_glow };
+            plot(fb, dx as f32, dy as f32, color);
         }
     }
 
-    // Rear wing — thin horizontal bar at very back
-    let wing_y = car_bottom - 2;
-    let wing_half = car_w / 2 + 6;
-    for dx in -wing_half..=wing_half {
-        for dy in 0..3i32 {
-            let px = (car_cx + dx) as u32;
-            let py = (wing_y + dy) as u32;
-            if px < w && py < h {
-                fb.put_pixel(px, py, body_dark);
-            }
-        }
+    // --- Thruster smoke rings (hovercraft exhaust) ---
+    draw_thruster_rings(fb, w, h, cx, cy, heading, world);
+}
+
+/// Draw expanding smoke rings behind the ship, like hovercraft exhaust.
+/// Multiple concentric ellipses at different ages expand and fade over time.
+fn draw_thruster_rings(
+    fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    w: u32,
+    h: u32,
+    cx: f32,
+    cy: f32,
+    heading: f32,
+    world: &WorldState,
+) {
+    let cos_h = heading.cos();
+    let sin_h = heading.sin();
+
+    // Throttle intensity drives ring brightness and count
+    let intensity = world.throttle.clamp(0.0, 1.0);
+    if intensity < 0.05 {
+        return;
     }
 
-    // Tail lights — two small bright red dots at rear corners
-    let tail_color = Rgba([255, 30, 30, 255]);
-    for &side in &[-1i32, 1] {
-        let tx = car_cx + side * (car_w / 2 - 4);
-        for dy in 0..3i32 {
-            for dx in 0..4i32 {
-                let px = (tx + dx * side) as u32;
-                let py = (car_bottom - 3 + dy) as u32;
-                if px < w && py < h {
-                    fb.put_pixel(px, py, tail_color);
-                }
+    // RPM normalized 0..1 for pulsing
+    let rpm_t = ((world.rpm - 1000.0) / 7000.0).clamp(0.0, 1.0);
+
+    // Number of visible rings (more at higher throttle)
+    let ring_count = (3.0 + intensity * 5.0) as u32;
+
+    // Time phase for ring animation — rings expand outward over time
+    let phase = world.time * (2.0 + rpm_t * 4.0); // faster spin at high RPM
+
+    for i in 0..ring_count {
+        // Each ring has a different age (0 = newest, ring_count-1 = oldest)
+        let age = (phase + i as f32 * 0.4) % (ring_count as f32 * 0.4);
+        let age_t = age / (ring_count as f32 * 0.4); // 0..1
+
+        // Ring expands as it ages
+        let base_rx = 4.0 + age_t * 20.0 * (0.5 + intensity * 0.5);
+        let base_ry = 2.0 + age_t * 8.0 * (0.5 + intensity * 0.5);
+
+        // Offset behind the ship — rings drift backward
+        let drift = 10.0 + age_t * 25.0;
+
+        // Alpha fades as ring ages
+        let alpha = ((1.0 - age_t) * intensity * 180.0) as u8;
+        if alpha < 8 {
+            continue;
+        }
+
+        // Color: cyan core → blue-white → dim blue as it ages
+        let r = (20.0 + (1.0 - age_t) * 100.0 * rpm_t) as u8;
+        let g = (80.0 + (1.0 - age_t) * 150.0) as u8;
+        let b = (180.0 + (1.0 - age_t) * 75.0) as u8;
+        let ring_color = Rgba([r, g, b, alpha]);
+
+        // Draw the ellipse ring (outline only, not filled)
+        let rx = base_rx as i32;
+        let ry = base_ry as i32;
+        if rx < 1 || ry < 1 {
+            continue;
+        }
+
+        // Bresenham-style ellipse outline
+        let steps = (rx.max(ry) * 6) as u32;
+        for s in 0..steps {
+            let angle = (s as f32 / steps as f32) * std::f32::consts::TAU;
+            let ex = angle.cos() * rx as f32;
+            let ey = angle.sin() * ry as f32;
+
+            // Rotate ring by heading and offset behind ship
+            let local_x = ex;
+            let local_y = ey + drift;
+            let rx2 = local_x * cos_h - local_y * sin_h;
+            let ry2 = local_x * sin_h + local_y * cos_h;
+
+            let px = (cx + rx2) as i32;
+            let py = (cy + ry2) as i32;
+            if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                let bg = *fb.get_pixel(px as u32, py as u32);
+                fb.put_pixel(px as u32, py as u32, blend_alpha(bg, ring_color));
             }
         }
     }
@@ -320,6 +413,7 @@ mod tests {
         WorldState {
             z_offset: 0.0,
             camera_z: 0.0,
+            camera: crate::world::camera::Camera::new(),
             speed,
             speed_target: speed,
             commits_per_min: cpm,
@@ -338,6 +432,21 @@ mod tests {
             curve_multiplier: 1.0,
             speed_hold_time: 0.0,
             curve_hold_time: 0.0,
+            gear: 0,
+            rpm: 1000.0,
+            throttle: 0.0,
+            shift_cooldown: 0.0,
+            just_shifted: false,
+            segments: {
+                use crate::world::road_segments;
+                let mut segs = Vec::with_capacity(road_segments::SEGMENT_COUNT);
+                for i in 0..road_segments::SEGMENT_COUNT {
+                    let z = i as f32 * road_segments::SEGMENT_LENGTH;
+                    segs.push(road_segments::generate_segment(z, 0.0, 0.0));
+                }
+                segs
+            },
+            segment_z_start: 0.0,
         }
     }
 

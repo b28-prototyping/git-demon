@@ -55,9 +55,13 @@ pub fn draw_hud(
     let files_text = format!("{} files", world.files_changed);
     font::draw_text(fb, &files_text, 380, text_y, white, 1);
 
+    // Gear + RPM
+    let gear_text = format!("G{}  {:.0}rpm", world.gear + 1, world.rpm);
+    font::draw_text(fb, &gear_text, 480, text_y, white, 1);
+
     // Tier badge
     let tier_color = tier_badge_color(world);
-    font::draw_text(fb, world.tier.name(), 480, text_y, tier_color, 1);
+    font::draw_text(fb, world.tier.name(), 620, text_y, tier_color, 1);
 
     // Repo name
     let repo_text = format!("repo: {}", seed.repo_name);
@@ -119,6 +123,12 @@ pub fn draw_dev_overlay(
             format!(
                 "speed: {:.0} -> {:.0}  x{:.1}",
                 world.speed, world.speed_target, world.speed_multiplier
+            ),
+            format!(
+                "gear: {}  rpm: {:.0}  thr: {:.0}%",
+                world.gear + 1,
+                world.rpm,
+                world.throttle * 100.0
             ),
             format!(
                 "tier: {:?}  curve_mul: {:.1}",
@@ -217,6 +227,7 @@ mod tests {
         WorldState {
             z_offset: 0.0,
             camera_z: 0.0,
+            camera: crate::world::camera::Camera::new(),
             speed: 1.0,
             speed_target: 1.0,
             commits_per_min: 2.5,
@@ -235,6 +246,21 @@ mod tests {
             curve_multiplier: 1.0,
             speed_hold_time: 0.0,
             curve_hold_time: 0.0,
+            gear: 0,
+            rpm: 1000.0,
+            throttle: 0.0,
+            shift_cooldown: 0.0,
+            just_shifted: false,
+            segments: {
+                use crate::world::road_segments;
+                let mut segs = Vec::with_capacity(road_segments::SEGMENT_COUNT);
+                for i in 0..road_segments::SEGMENT_COUNT {
+                    let z = i as f32 * road_segments::SEGMENT_LENGTH;
+                    segs.push(road_segments::generate_segment(z, 0.0, 0.0));
+                }
+                segs
+            },
+            segment_z_start: 0.0,
         }
     }
 

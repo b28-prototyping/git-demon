@@ -28,6 +28,111 @@ pub fn draw_sky(
     }
 }
 
+/// Procedural starfield that doubles as the warp-speed effect.
+/// At rest: twinkling dots scattered across the sky.
+/// At speed: stars stretch into radial streaks from the vanishing point,
+/// creating an asteroid-field / hyperspace tunnel look.
+pub fn draw_stars(
+    fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    w: u32,
+    horizon_y: u32,
+    world: &WorldState,
+) {
+    if horizon_y == 0 || w == 0 {
+        return;
+    }
+    let star_count = 600u32;
+    // Stars converge at 60% of horizon — intentional parallax offset
+    // so the distant starfield appears to have a different focal point
+    // than the road/ground projection.
+    let cx = w as f32 / 2.0;
+    let pitch_shift = world.camera.pitch_offset(0.0, horizon_y);
+    let cy = horizon_y as f32 * 0.6 + pitch_shift;
+    let twinkle_phase = world.time * 3.0;
+
+    let speed_t = (world.speed / 300.0).clamp(0.0, 1.0);
+    let streak_len = speed_t * 40.0;
+
+    let fb_h = fb.height();
+    let raw = fb.as_mut();
+    let stride = w as usize * 4;
+    let h_limit = horizon_y.min(fb_h);
+
+    for i in 0..star_count {
+        let hash = i.wrapping_mul(2654435761);
+        let hash2 = i.wrapping_mul(1664525).wrapping_add(1013904223);
+
+        let angle = (hash as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+        let dist_frac = (hash2 as f32 / u32::MAX as f32).sqrt();
+        let max_dist = (cx.max(cy) * 1.5).max(100.0);
+        let dist = 10.0 + dist_frac * max_dist;
+
+        let sx = cx + angle.cos() * dist;
+        let sy = cy + angle.sin() * dist;
+
+        if sy < 0.0 || sy >= horizon_y as f32 || sx < 0.0 || sx >= w as f32 {
+            continue;
+        }
+
+        // Brightness — cheap integer twinkle instead of sin()
+        let base_bright = ((hash >> 5) & 0xFF) as u16;
+        let twinkle_idx = ((twinkle_phase * 256.0) as u32).wrapping_add(hash >> 3);
+        let twinkle = 180 + (twinkle_idx % 76) as u16; // 180..255 range
+        let bright = base_bright * twinkle / 255;
+
+        // Dimmer near horizon — integer approx
+        let sy_frac = (sy * 256.0 / horizon_y as f32) as u32;
+        let fade = 256u32.saturating_sub(sy_frac * sy_frac / 256);
+        let b = ((bright as u32 * fade / 256) as u16).min(255);
+        if b < 20 {
+            continue;
+        }
+        let b_blue = (b * 4 / 3).min(255);
+
+        if streak_len < 1.0 {
+            let px = sx as u32;
+            let py = sy as u32;
+            if px < w && py < h_limit {
+                let off = py as usize * stride + px as usize * 4;
+                if off + 3 < raw.len() {
+                    raw[off] = (raw[off] as u16 + b).min(255) as u8;
+                    raw[off + 1] = (raw[off + 1] as u16 + b).min(255) as u8;
+                    raw[off + 2] = (raw[off + 2] as u16 + b_blue).min(255) as u8;
+                }
+            }
+        } else {
+            let dx = sx - cx;
+            let dy = sy - cy;
+            let len = dx.hypot(dy).max(0.01);
+            let ndx = dx / len;
+            let ndy = dy / len;
+
+            let this_streak = streak_len * (dist / max_dist).min(1.0);
+            let steps = this_streak as i32;
+            // Step by 2 at high speed to halve pixel ops
+            let step_size = if steps > 10 { 2 } else { 1 };
+
+            let mut s = 0;
+            while s <= steps {
+                let a = (b as u32 * (steps - s * 7 / 10) as u32 / steps.max(1) as u32) as u16;
+                let a_blue = (a * 4 / 3).min(255);
+
+                let px = (sx + ndx * s as f32) as i32;
+                let py = (sy + ndy * s as f32) as i32;
+                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h_limit {
+                    let off = py as usize * stride + px as usize * 4;
+                    if off + 3 < raw.len() {
+                        raw[off] = (raw[off] as u16 + a).min(255) as u8;
+                        raw[off + 1] = (raw[off + 1] as u16 + a).min(255) as u8;
+                        raw[off + 2] = (raw[off + 2] as u16 + a_blue).min(255) as u8;
+                    }
+                }
+                s += step_size;
+            }
+        }
+    }
+}
+
 pub fn draw_sun(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     w: u32,
@@ -36,7 +141,8 @@ pub fn draw_sun(
     world: &WorldState,
 ) {
     let cx = (w as f32 * 0.72) as i32;
-    let cy = horizon_y as i32 - 40;
+    let pitch_shift = world.camera.pitch_offset(0.05, horizon_y);
+    let cy = horizon_y as i32 - 40 + pitch_shift as i32;
     let pulse = (world.time * (world.commits_per_min * 0.4).min(3.0) * std::f32::consts::TAU).sin();
     let radius = 18.0 + pulse * 3.0;
     let r2 = radius * radius;
@@ -66,7 +172,8 @@ pub fn draw_bloom_bleed(
     world: &WorldState,
 ) {
     let bleed_rows = 6u32;
-    let start_y = horizon_y.saturating_sub(bleed_rows);
+    let pitch_shift = world.camera.pitch_offset(0.05, horizon_y) as i32;
+    let start_y = (horizon_y as i32 - bleed_rows as i32 + pitch_shift).max(0) as u32;
     let hue = if world.tier as u8 >= 4 {
         (seed.accent_hue + world.time) % 360.0
     } else {
@@ -206,5 +313,37 @@ mod tests {
         assert_eq!(result.0[0], 255);
         assert_eq!(result.0[1], 0);
         assert_eq!(result.0[2], 0);
+    }
+
+    #[test]
+    fn test_stars_shift_with_pitch() {
+        use crate::git::seed::RepoSeed;
+        use std::collections::HashMap;
+
+        let seed = RepoSeed {
+            accent_hue: 180.0,
+            saturation: 0.8,
+            terrain_roughness: 0.5,
+            speed_base: 0.5,
+            author_colors: HashMap::new(),
+            total_commits: 100,
+            repo_name: "test-repo".to_string(),
+        };
+
+        let render = |pitch: f32| -> Vec<u8> {
+            let mut world = crate::world::WorldState::new(&seed);
+            world.camera.pitch = pitch;
+            let (w, horizon_y) = (200u32, 80u32);
+            let mut fb = ImageBuffer::from_pixel(w, horizon_y, Rgba([0, 0, 0, 255]));
+            draw_stars(&mut fb, w, horizon_y, &world);
+            fb.into_raw()
+        };
+
+        let no_pitch = render(0.0);
+        let with_pitch = render(0.3);
+        assert_ne!(
+            no_pitch, with_pitch,
+            "pitch should shift star convergence point"
+        );
     }
 }

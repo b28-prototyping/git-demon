@@ -1,7 +1,7 @@
 use image::{ImageBuffer, Rgba};
 
 use super::font;
-use super::road;
+use super::road_table::{self, RoadRow};
 use crate::git::seed::RepoSeed;
 use crate::world::objects::{Lane, RoadsideObject};
 use crate::world::WorldState;
@@ -9,8 +9,6 @@ use crate::world::WorldState;
 const COMMIT_CAR_BASE_W: f32 = 40.0;
 const COMMIT_CAR_BASE_H: f32 = 20.0;
 const TIER_GATE_BASE_W: f32 = 80.0;
-
-pub const ROAD_MIN_HALF: f32 = 8.0;
 
 pub struct SpriteScreenPos {
     pub x: u32,
@@ -25,23 +23,25 @@ pub(crate) fn project(
     pixel_w: u32,
     pixel_h: u32,
     horizon_y: u32,
+    rtable: &[RoadRow],
 ) -> Option<SpriteScreenPos> {
-    let z_rel = z_world - world.camera_z;
-    if z_rel <= 0.0 {
-        return None;
-    }
-
-    let draw_dist = world.draw_distance();
-    let depth_scale = (1.0 - z_rel / draw_dist).clamp(0.0, 1.0);
+    let cam = &world.camera;
+    let (screen_y, depth_scale) = cam.project(z_world, pixel_h, horizon_y)?;
     if depth_scale < 0.02 {
         return None;
     }
 
-    let screen_y = lerp(horizon_y as f32, pixel_h as f32, depth_scale) as u32;
-    let max_half = road::road_max_half(world);
-    let road_half_here = lerp(ROAD_MIN_HALF, max_half, depth_scale);
+    // Use road table for per-segment curve and slope offsets if available
+    let (curve_off, slope_off) = if let Some((curve, slope, _)) =
+        road_table::lookup_at_z(rtable, z_world, world.camera_z, horizon_y)
+    {
+        (curve * depth_scale * depth_scale, slope)
+    } else {
+        (world.curve_offset * depth_scale * depth_scale, 0.0)
+    };
 
-    let cx = pixel_w as f32 / 2.0 + world.curve_offset * depth_scale * depth_scale;
+    let road_half_here = cam.road_half(depth_scale);
+    let cx = pixel_w as f32 / 2.0 + curve_off;
 
     let lane_x = match lane {
         Lane::Left => (cx - road_half_here * 1.15).max(0.0) as u32,
@@ -51,15 +51,13 @@ pub(crate) fn project(
         Lane::RoadRight => (cx + road_half_here * 0.35) as u32,
     };
 
+    let final_y = (screen_y + slope_off).max(0.0) as u32;
+
     Some(SpriteScreenPos {
         x: lane_x,
-        y: screen_y,
+        y: final_y,
         scale: depth_scale,
     })
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
 }
 
 pub fn draw_sprites(
@@ -69,13 +67,14 @@ pub fn draw_sprites(
     horizon_y: u32,
     world: &WorldState,
     _seed: &RepoSeed,
+    rtable: &[RoadRow],
 ) {
     // Sort by z_world descending (far objects first)
     let mut sorted: Vec<_> = world.active_objects.iter().collect();
     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     for (lane, z_world, obj) in sorted {
-        let Some(pos) = project(*z_world, *lane, world, w, h, horizon_y) else {
+        let Some(pos) = project(*z_world, *lane, world, w, h, horizon_y, rtable) else {
             continue;
         };
 
@@ -349,14 +348,16 @@ mod tests {
         let seed = test_seed();
         let mut w = WorldState::new(&seed);
         w.camera_z = 0.0;
+        w.camera.z = 0.0;
         w.speed = 1.0;
         w.curve_offset = 0.0;
         w.tier = VelocityTier::Cruise;
+        w.camera.sync(w.speed, w.tier);
         w
     }
 
     fn horizon_y(h: u32, world: &WorldState) -> u32 {
-        (h as f32 * road::horizon_ratio(world)) as u32
+        world.camera.horizon_y(h)
     }
 
     // --- Projection unit tests ---
@@ -365,16 +366,16 @@ mod tests {
     fn test_project_behind_camera() {
         let mut world = test_world();
         world.camera_z = 50.0;
-        let result = project(40.0, Lane::Center, &world, 400, 200, 70);
+        world.camera.z = 50.0;
+        let result = project(40.0, Lane::Center, &world, 400, 200, 70, &[]);
         assert!(result.is_none(), "Object behind camera should return None");
     }
 
     #[test]
     fn test_project_beyond_draw_distance() {
         let world = test_world();
-        // draw_distance is 200.0 for Cruise tier, camera_z=0
-        // z_rel = 300, depth_scale = (1 - 300/200) clamped to 0.0 → < 0.02 → None
-        let result = project(300.0, Lane::Center, &world, 400, 200, 70);
+        // draw_distance is 5000.0 for Cruise tier, camera_z=0
+        let result = project(7500.0, Lane::Center, &world, 400, 200, 70, &[]);
         assert!(
             result.is_none(),
             "Object beyond draw distance should return None"
@@ -384,16 +385,17 @@ mod tests {
     #[test]
     fn test_project_valid_returns_some() {
         let world = test_world();
-        let result = project(50.0, Lane::Center, &world, 400, 200, 70);
+        // z_world=50, camera_z=0 → z_rel=50, depth_scale=10/50=0.2 (above 0.02)
+        let result = project(50.0, Lane::Center, &world, 400, 200, 70, &[]);
         assert!(result.is_some(), "In-range object should return Some");
     }
 
     #[test]
     fn test_project_depth_scale() {
         let world = test_world();
-        // z_world=100, camera_z=0, draw_dist=200
-        // depth_scale = 1 - 100/200 = 0.5
-        let pos = project(100.0, Lane::Center, &world, 400, 200, 70).unwrap();
+        // z_world=20, camera_z=0, z_rel=20
+        // 1/z depth: depth_scale = NEAR_PLANE / z_rel = 10 / 20 = 0.5
+        let pos = project(20.0, Lane::Center, &world, 400, 200, 70, &[]).unwrap();
         assert!(
             (pos.scale - 0.5).abs() < 0.01,
             "Expected scale ~0.5, got {}",
@@ -407,8 +409,8 @@ mod tests {
         let (w, h) = (400, 200);
         let hy = horizon_y(h, &world);
 
-        let far = project(150.0, Lane::Center, &world, w, h, hy).unwrap();
-        let near = project(50.0, Lane::Center, &world, w, h, hy).unwrap();
+        let far = project(200.0, Lane::Center, &world, w, h, hy, &[]).unwrap();
+        let near = project(50.0, Lane::Center, &world, w, h, hy, &[]).unwrap();
 
         assert!(
             near.y > far.y,
@@ -424,9 +426,9 @@ mod tests {
         let (w, h) = (400, 200);
         let hy = horizon_y(h, &world);
 
-        let left = project(50.0, Lane::Left, &world, w, h, hy).unwrap();
-        let center = project(50.0, Lane::Center, &world, w, h, hy).unwrap();
-        let right = project(50.0, Lane::Right, &world, w, h, hy).unwrap();
+        let left = project(50.0, Lane::Left, &world, w, h, hy, &[]).unwrap();
+        let center = project(50.0, Lane::Center, &world, w, h, hy, &[]).unwrap();
+        let right = project(50.0, Lane::Right, &world, w, h, hy, &[]).unwrap();
 
         assert!(
             left.x < center.x,
@@ -448,11 +450,11 @@ mod tests {
         let (w, h) = (400, 200);
         let hy = horizon_y(h, &world);
 
-        let road_left = project(50.0, Lane::RoadLeft, &world, w, h, hy).unwrap();
-        let center = project(50.0, Lane::Center, &world, w, h, hy).unwrap();
-        let road_right = project(50.0, Lane::RoadRight, &world, w, h, hy).unwrap();
-        let verge_left = project(50.0, Lane::Left, &world, w, h, hy).unwrap();
-        let verge_right = project(50.0, Lane::Right, &world, w, h, hy).unwrap();
+        let road_left = project(50.0, Lane::RoadLeft, &world, w, h, hy, &[]).unwrap();
+        let center = project(50.0, Lane::Center, &world, w, h, hy, &[]).unwrap();
+        let road_right = project(50.0, Lane::RoadRight, &world, w, h, hy, &[]).unwrap();
+        let verge_left = project(50.0, Lane::Left, &world, w, h, hy, &[]).unwrap();
+        let verge_right = project(50.0, Lane::Right, &world, w, h, hy, &[]).unwrap();
 
         assert!(
             road_left.x > verge_left.x,
@@ -487,11 +489,11 @@ mod tests {
         let mut world_straight = test_world();
         world_straight.curve_offset = 0.0;
         let hy = horizon_y(h, &world_straight);
-        let straight = project(50.0, Lane::Center, &world_straight, w, h, hy).unwrap();
+        let straight = project(50.0, Lane::Center, &world_straight, w, h, hy, &[]).unwrap();
 
         let mut world_curved = test_world();
         world_curved.curve_offset = 80.0;
-        let curved = project(50.0, Lane::Center, &world_curved, w, h, hy).unwrap();
+        let curved = project(50.0, Lane::Center, &world_curved, w, h, hy, &[]).unwrap();
 
         assert!(
             curved.x > straight.x,
@@ -512,7 +514,7 @@ mod tests {
         let hy = horizon_y(h, &world);
 
         let before: Vec<u8> = fb.as_raw().clone();
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
         assert_eq!(
             fb.as_raw().as_slice(),
             before.as_slice(),
@@ -539,7 +541,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_author_color = fb.pixels().any(|p| *p == author_color);
         assert!(
@@ -569,7 +571,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_white = fb.pixels().any(|p| *p == white);
         assert!(has_white, "Near CommitCar should have white text pixels");
@@ -585,10 +587,10 @@ mod tests {
 
         let mut world = test_world();
         let hy = horizon_y(h, &world);
-        // Place far: z_rel=160, scale = 1 - 160/200 = 0.2 < 0.5
+        // Place far: z_rel=100, 1/z scale = 10/100 = 0.1 < 0.5
         world.active_objects.push((
             Lane::RoadRight,
-            160.0,
+            100.0,
             RoadsideObject::CommitCar {
                 message: "Hello".to_string(),
                 author: "dev".to_string(),
@@ -596,7 +598,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_white = fb.pixels().any(|p| *p == white);
         assert!(!has_white, "Far CommitCar (scale<0.5) should suppress text");
@@ -617,7 +619,7 @@ mod tests {
                 20.0,
                 RoadsideObject::AdditionTower { lines, color },
             ));
-            draw_sprites(&mut fb, w, h, hy, &world, &seed);
+            draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
             fb.pixels().filter(|p| **p == color).count()
         };
 
@@ -644,7 +646,7 @@ mod tests {
             RoadsideObject::DeletionShard { lines: 200 },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_crimson = fb.pixels().any(|p| *p == crimson);
         assert!(has_crimson, "DeletionShard should render crimson pixels");
@@ -667,7 +669,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let neon_count = fb.pixels().filter(|p| **p == neon).count();
         assert!(
@@ -693,7 +695,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_yellow = fb.pixels().any(|p| *p == yellow);
         assert!(has_yellow, "VelocitySign should render yellow pixels");
@@ -708,11 +710,11 @@ mod tests {
 
         let mut world = test_world();
         let hy = horizon_y(h, &world);
-        // Place very far: scale small enough that car_w < 4 (dot LOD)
-        // scale = 1 - 180/200 = 0.1, car_w = 40 * 0.01 = 0.4 → dot
+        // Place far: scale small enough that car_w < 4 (dot LOD)
+        // 1/z: z_rel=200, scale=10/200=0.05, car_w=40*0.0025=0.1 → dot
         world.active_objects.push((
             Lane::RoadLeft,
-            180.0,
+            200.0,
             RoadsideObject::CommitCar {
                 message: "far".to_string(),
                 author: "dev".to_string(),
@@ -720,7 +722,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_color = fb.pixels().any(|p| *p == author_color);
         assert!(
@@ -760,7 +762,7 @@ mod tests {
             },
         ));
 
-        draw_sprites(&mut fb, w, h, hy, &world, &seed);
+        draw_sprites(&mut fb, w, h, hy, &world, &seed, &[]);
 
         let has_near = fb.pixels().any(|p| *p == near_color);
         assert!(
