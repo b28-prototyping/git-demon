@@ -361,4 +361,217 @@ mod tests {
         // parallax=1.0 (ground): offset = 0.5 * 0.0 * 200 * 0.5 = 0.0
         assert!((c.pitch_offset(1.0, 200)).abs() < 0.001);
     }
+
+    // --- Dynamic camera response tests ---
+
+    #[test]
+    fn test_fov_increases_with_speed() {
+        let mut c = cam();
+        // Run several frames at high speed
+        for _ in 0..60 {
+            c.update(0.016, 300.0, 0.0, 0.0, VelocityTier::Active, 0.0);
+        }
+        assert!(
+            c.fov_scale > 1.1,
+            "fov_scale should widen with high speed, got {}",
+            c.fov_scale
+        );
+    }
+
+    #[test]
+    fn test_fov_spring_damped() {
+        let mut c = cam();
+        // Single small dt step should not reach target
+        c.update(0.016, 300.0, 0.0, 0.0, VelocityTier::Active, 0.0);
+        // Target is 1.25, should not reach it in one frame
+        assert!(
+            c.fov_scale < 1.25,
+            "fov_scale should not jump to target in one frame, got {}",
+            c.fov_scale
+        );
+        assert!(
+            c.fov_scale > 1.0,
+            "fov_scale should have started moving, got {}",
+            c.fov_scale
+        );
+    }
+
+    #[test]
+    fn test_pitch_responds_to_slope() {
+        let mut c = cam();
+        // Uphill slope (positive slope)
+        for _ in 0..60 {
+            c.update(0.016, 100.0, 0.0, 0.5, VelocityTier::Active, 0.0);
+        }
+        // Target: -0.5 * 0.03 = -0.015 (look down on uphill)
+        assert!(
+            c.pitch < -0.01,
+            "pitch should be negative on uphill slope, got {}",
+            c.pitch
+        );
+    }
+
+    #[test]
+    fn test_pitch_clamped() {
+        let mut c = cam();
+        // Extreme slope
+        for _ in 0..120 {
+            c.update(0.016, 100.0, 0.0, 10.0, VelocityTier::Active, 0.0);
+        }
+        assert!(
+            c.pitch.abs() <= PITCH_MAX + 0.001,
+            "pitch should be clamped to ±PITCH_MAX, got {}",
+            c.pitch
+        );
+    }
+
+    #[test]
+    fn test_yaw_responds_to_curve() {
+        let mut c = cam();
+        // Positive curve_offset → camera should lag opposite (negative yaw)
+        for _ in 0..60 {
+            c.update(0.016, 100.0, 80.0, 0.0, VelocityTier::Active, 0.0);
+        }
+        assert!(
+            c.yaw_offset < -1.0,
+            "yaw should shift negative on positive curve, got {}",
+            c.yaw_offset
+        );
+    }
+
+    #[test]
+    fn test_yaw_clamped() {
+        let mut c = cam();
+        // Extreme curve
+        for _ in 0..120 {
+            c.update(0.016, 100.0, 500.0, 0.0, VelocityTier::Active, 0.0);
+        }
+        assert!(
+            c.yaw_offset.abs() <= YAW_MAX + SHAKE_X_AMP + 0.1,
+            "yaw should be clamped near ±YAW_MAX, got {}",
+            c.yaw_offset
+        );
+    }
+
+    #[test]
+    fn test_shake_only_velocity_demon() {
+        // Non-VelocityDemon: update with zero inputs, yaw and pitch should stay near zero
+        let mut c = cam();
+        for i in 0..60 {
+            c.update(
+                0.016,
+                100.0,
+                0.0,
+                0.0,
+                VelocityTier::Demon,
+                i as f32 * 0.016,
+            );
+        }
+        assert!(
+            c.yaw_offset.abs() < 0.1,
+            "non-VelocityDemon should have no shake, got yaw={}",
+            c.yaw_offset
+        );
+
+        // VelocityDemon: yaw should have shake component
+        let mut c2 = cam();
+        let mut max_yaw = 0.0f32;
+        for i in 0..120 {
+            c2.update(
+                0.016,
+                100.0,
+                0.0,
+                0.0,
+                VelocityTier::VelocityDemon,
+                i as f32 * 0.016,
+            );
+            max_yaw = max_yaw.max(c2.yaw_offset.abs());
+        }
+        assert!(
+            max_yaw > 0.5,
+            "VelocityDemon should have visible shake, max_yaw={}",
+            max_yaw
+        );
+    }
+
+    #[test]
+    fn test_burst_zoom_and_recovery() {
+        let mut c = cam();
+        c.trigger_burst();
+        assert!(
+            c.burst_fov_offset < 0.0,
+            "burst should set negative fov offset"
+        );
+
+        // Run a few frames — burst should recover
+        for _ in 0..120 {
+            c.update(0.016, 100.0, 0.0, 0.0, VelocityTier::Active, 0.0);
+        }
+        assert!(
+            c.burst_fov_offset.abs() < 0.01,
+            "burst fov offset should decay near zero, got {}",
+            c.burst_fov_offset
+        );
+    }
+
+    #[test]
+    fn test_burst_temporarily_reduces_fov() {
+        let mut c = cam();
+        // Settle at a base FOV
+        for _ in 0..60 {
+            c.update(0.016, 100.0, 0.0, 0.0, VelocityTier::Active, 0.0);
+        }
+        let settled_fov = c.fov_scale;
+
+        // Trigger burst and update one frame
+        c.trigger_burst();
+        c.update(0.016, 100.0, 0.0, 0.0, VelocityTier::Active, 0.0);
+
+        assert!(
+            c.fov_scale < settled_fov,
+            "burst should temporarily reduce fov: settled={}, burst={}",
+            settled_fov,
+            c.fov_scale
+        );
+    }
+
+    #[test]
+    fn test_all_springs_converge() {
+        let mut c = cam();
+        // Drive with constant inputs for many frames
+        for i in 0..300 {
+            c.update(
+                0.016,
+                200.0,
+                50.0,
+                0.3,
+                VelocityTier::Active,
+                i as f32 * 0.016,
+            );
+        }
+        // FOV target: 1.0 + (200/300) * 0.25 ≈ 1.167
+        let fov_target = 1.0 + (200.0_f32 / 300.0).clamp(0.0, 1.0) * FOV_SPEED_SCALE;
+        assert!(
+            (c.fov_scale - fov_target).abs() < 0.02,
+            "fov should converge: expected ~{}, got {}",
+            fov_target,
+            c.fov_scale
+        );
+        // Pitch target: -0.3 * 0.03 = -0.009
+        let pitch_target = (-0.3 * PITCH_SLOPE_FACTOR).clamp(-PITCH_MAX, PITCH_MAX);
+        assert!(
+            (c.pitch - pitch_target).abs() < 0.005,
+            "pitch should converge: expected ~{}, got {}",
+            pitch_target,
+            c.pitch
+        );
+        // Yaw target: -50.0 * 0.15 = -7.5
+        let yaw_target = (-50.0 * YAW_CURVE_FACTOR).clamp(-YAW_MAX, YAW_MAX);
+        assert!(
+            (c.yaw_offset - yaw_target).abs() < 0.5,
+            "yaw should converge: expected ~{}, got {}",
+            yaw_target,
+            c.yaw_offset
+        );
+    }
 }

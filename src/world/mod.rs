@@ -109,10 +109,7 @@ impl WorldState {
         }
         let offset = self.camera_z - self.segment_z_start;
         let idx = (offset / road_segments::SEGMENT_LENGTH) as usize;
-        self.segments
-            .get(idx)
-            .map(|s| s.slope)
-            .unwrap_or(0.0)
+        self.segments.get(idx).map(|s| s.slope).unwrap_or(0.0)
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -681,5 +678,90 @@ mod tests {
         let mut w = WorldState::new(&seed);
         w.tier = VelocityTier::Demon;
         assert_eq!(w.tier_index(), 3);
+    }
+
+    // --- Dynamic camera integration tests ---
+
+    #[test]
+    fn test_slope_at_camera_returns_segment_slope() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        // First segment slope at z=0
+        let expected = w.segments[0].slope;
+        let actual = w.slope_at_camera();
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "slope_at_camera should match first segment: expected {expected}, got {actual}"
+        );
+        // Move camera to second segment
+        w.camera_z = road_segments::SEGMENT_LENGTH + 1.0;
+        let expected = w.segments[1].slope;
+        let actual = w.slope_at_camera();
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "slope_at_camera should match second segment: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn test_burst_cooldown_set_on_high_cpm() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        assert_eq!(w.burst_cooldown, 0.0);
+        let poll = empty_poll(1.5); // > 1.0 triggers burst
+        w.ingest_poll(&poll, &seed);
+        assert!(
+            w.burst_cooldown > 0.0,
+            "burst_cooldown should be set on high cpm poll"
+        );
+    }
+
+    #[test]
+    fn test_burst_cooldown_decays() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.burst_cooldown = 0.5;
+        w.update(0.1);
+        assert!(
+            w.burst_cooldown < 0.5,
+            "burst_cooldown should decay: got {}",
+            w.burst_cooldown
+        );
+        assert!(w.burst_cooldown > 0.0, "should not fully decay yet");
+    }
+
+    #[test]
+    fn test_camera_pitch_after_update_with_slope() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        // Set segments with strong slope
+        for seg in &mut w.segments {
+            seg.slope = 0.5;
+        }
+        // Run several frames
+        for _ in 0..60 {
+            w.update(0.016);
+        }
+        assert!(
+            w.camera.pitch.abs() > 0.001,
+            "camera pitch should respond to road slope, got {}",
+            w.camera.pitch
+        );
+    }
+
+    #[test]
+    fn test_camera_fov_increases_during_world_update() {
+        let seed = test_seed();
+        let mut w = WorldState::new(&seed);
+        w.commits_per_min = 4.0; // High activity → high speed
+                                 // Run many frames to accelerate
+        for _ in 0..300 {
+            w.update(0.016);
+        }
+        assert!(
+            w.camera.fov_scale > 1.0,
+            "camera fov should widen at speed, got {}",
+            w.camera.fov_scale
+        );
     }
 }
