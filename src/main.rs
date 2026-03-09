@@ -227,6 +227,10 @@ fn run(args: Args) -> anyhow::Result<()> {
                 },
                 // Normal gameplay keys (not in menu)
                 Event::Key(k) if k.code == KeyCode::Char('q') => quit = true,
+                Event::Key(k) if k.code == KeyCode::Char('p') => {
+                    use git_demon::renderer::hud::DEV_PAGE_COUNT;
+                    renderer.dev_page = (renderer.dev_page + 1) % DEV_PAGE_COUNT;
+                }
                 Event::Key(k) if k.code == KeyCode::Up => {
                     speed_input = true;
                     world.speed_hold_time += dt;

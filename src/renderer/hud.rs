@@ -65,6 +65,8 @@ pub fn draw_hud(
     font::draw_text(fb, &repo_text, repo_x, text_y, white, 1);
 }
 
+pub const DEV_PAGE_COUNT: u8 = 3;
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_dev_overlay(
     fb: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
@@ -77,49 +79,77 @@ pub fn draw_dev_overlay(
     render_fps: f32,
     target_render_fps: u32,
     encode_send_us: u128,
+    pass: &super::PassTimings,
+    page: u8,
 ) {
-    let lines = [
-        "-- DEV --".to_string(),
-        format!(
-            "frame: {}  raster: {:.1}ms  enc: {:.1}ms",
-            frame_count,
-            render_us as f64 / 1000.0,
-            encode_send_us as f64 / 1000.0,
-        ),
-        format!(
-            "world: {:.0}hz  render: {:.0}/{}fps",
-            world_fps, render_fps, target_render_fps,
-        ),
-        format!("res: {}x{}", w, fb.height()),
-        format!(
-            "speed: {:.2} -> {:.2}  x{:.1}",
-            world.speed, world.speed_target, world.speed_multiplier
-        ),
-        format!(
-            "tier: {:?}  curve_mul: {:.1}",
-            world.tier, world.curve_multiplier
-        ),
-        format!("cpm: {:.2}", world.commits_per_min),
-        format!("cam_z: {:.1}  z_off: {:.1}", world.camera_z, world.z_offset),
-        format!(
-            "curve: {:.1} -> {:.1}  steer: {:.1}",
-            world.curve_offset, world.curve_target, world.steer_angle
-        ),
-        format!(
-            "objects: {} active  {} pending",
-            world.active_objects.len(),
-            world.pending_objects.len()
-        ),
-        format!(
-            "+{} -{} {} files",
-            world.lines_added, world.lines_deleted, world.files_changed
-        ),
-        format!(
-            "hue: {:.0}  rough: {:.2}",
-            seed.accent_hue, seed.terrain_roughness
-        ),
-        format!("repo: {}", seed.repo_name),
-    ];
+    let us = |v: u128| v as f64 / 1000.0;
+    let lines: Vec<String> = match page {
+        // Page 0: Performance
+        0 => vec![
+            format!("-- PERF [{}/{}] (p:next) --", page + 1, DEV_PAGE_COUNT),
+            format!(
+                "frame: {}  raster: {:.1}ms  enc: {:.1}ms",
+                frame_count,
+                render_us as f64 / 1000.0,
+                encode_send_us as f64 / 1000.0,
+            ),
+            format!(
+                "sky:{:.1} ter:{:.1} road:{:.1} spr:{:.1}",
+                us(pass.sky_us),
+                us(pass.terrain_us),
+                us(pass.road_us),
+                us(pass.sprites_us),
+            ),
+            format!(
+                "blur:{:.1} bloom:{:.1} scan:{:.1} hud:{:.1}",
+                us(pass.blur_us),
+                us(pass.bloom_us),
+                us(pass.scanline_us),
+                us(pass.hud_us),
+            ),
+            format!(
+                "world: {:.0}hz  render: {:.0}/{}fps",
+                world_fps, render_fps, target_render_fps,
+            ),
+            format!("res: {}x{}", w, fb.height()),
+        ],
+        // Page 1: World state
+        1 => vec![
+            format!("-- WORLD [{}/{}] (p:next) --", page + 1, DEV_PAGE_COUNT),
+            format!(
+                "speed: {:.0} -> {:.0}  x{:.1}",
+                world.speed, world.speed_target, world.speed_multiplier
+            ),
+            format!(
+                "tier: {:?}  curve_mul: {:.1}",
+                world.tier, world.curve_multiplier
+            ),
+            format!("cpm: {:.2}", world.commits_per_min),
+            format!("cam_z: {:.0}  z_off: {:.0}", world.camera_z, world.z_offset),
+            format!(
+                "curve: {:.1} -> {:.1}  steer: {:.1}",
+                world.curve_offset, world.curve_target, world.steer_angle
+            ),
+            format!(
+                "objects: {} active  {} pending",
+                world.active_objects.len(),
+                world.pending_objects.len()
+            ),
+        ],
+        // Page 2: Repo info
+        _ => vec![
+            format!("-- REPO [{}/{}] (p:next) --", page + 1, DEV_PAGE_COUNT),
+            format!(
+                "+{} -{} {} files",
+                world.lines_added, world.lines_deleted, world.files_changed
+            ),
+            format!(
+                "hue: {:.0}  rough: {:.2}",
+                seed.accent_hue, seed.terrain_roughness
+            ),
+            format!("repo: {}", seed.repo_name),
+        ],
+    };
 
     let line_h = 10u32;
     let pad = 4u32;
