@@ -155,7 +155,9 @@ mod tests {
         // Configure a default committer for the repo
         let mut config = repo.config().expect("config");
         config.set_str("user.name", "Test").expect("set user.name");
-        config.set_str("user.email", "test@test.com").expect("set user.email");
+        config
+            .set_str("user.email", "test@test.com")
+            .expect("set user.email");
 
         let base_time = chrono::Utc::now().timestamp() - 300; // 5 minutes ago
 
@@ -164,16 +166,14 @@ mod tests {
             std::fs::write(&file_path, content).expect("write file");
 
             let mut index = repo.index().expect("index");
-            index
-                .add_path(Path::new("test.txt"))
-                .expect("add to index");
+            index.add_path(Path::new("test.txt")).expect("add to index");
             index.write().expect("write index");
             let tree_oid = index.write_tree().expect("write tree");
             let tree = repo.find_tree(tree_oid).expect("find tree");
 
             let sig_time = git2::Time::new(base_time + (i as i64) * 10, 0);
-            let sig = git2::Signature::new(author_name, "test@test.com", &sig_time)
-                .expect("signature");
+            let sig =
+                git2::Signature::new(author_name, "test@test.com", &sig_time).expect("signature");
 
             let parent = if i == 0 {
                 None
@@ -191,7 +191,8 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("git-demon-test-{}-{}", name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("git-demon-test-{}-{}", name, std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -324,11 +325,7 @@ mod tests {
         let dir = temp_dir("cpm");
         create_test_repo(
             &dir,
-            &[
-                ("c1", "A", "a\n"),
-                ("c2", "A", "b\n"),
-                ("c3", "A", "c\n"),
-            ],
+            &[("c1", "A", "a\n"), ("c2", "A", "b\n"), ("c3", "A", "c\n")],
         );
 
         let result = poll_once(dir.to_str().unwrap(), 10).expect("poll");

@@ -46,17 +46,26 @@ mod tests {
 
     #[test]
     fn test_tier_flatline() {
-        assert_eq!(VelocityTier::from_commits_per_min(0.0), VelocityTier::Flatline);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(0.0),
+            VelocityTier::Flatline
+        );
     }
 
     #[test]
     fn test_tier_cruise() {
-        assert_eq!(VelocityTier::from_commits_per_min(0.1), VelocityTier::Cruise);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(0.1),
+            VelocityTier::Cruise
+        );
     }
 
     #[test]
     fn test_tier_active_at_threshold() {
-        assert_eq!(VelocityTier::from_commits_per_min(0.5), VelocityTier::Active);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(0.5),
+            VelocityTier::Active
+        );
     }
 
     #[test]
@@ -66,27 +75,42 @@ mod tests {
 
     #[test]
     fn test_tier_velocity_demon_at_threshold() {
-        assert_eq!(VelocityTier::from_commits_per_min(4.0), VelocityTier::VelocityDemon);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(4.0),
+            VelocityTier::VelocityDemon
+        );
     }
 
     #[test]
     fn test_tier_boundary_below_active() {
-        assert_eq!(VelocityTier::from_commits_per_min(0.49), VelocityTier::Cruise);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(0.49),
+            VelocityTier::Cruise
+        );
     }
 
     #[test]
     fn test_tier_boundary_below_demon() {
-        assert_eq!(VelocityTier::from_commits_per_min(1.49), VelocityTier::Active);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(1.49),
+            VelocityTier::Active
+        );
     }
 
     #[test]
     fn test_tier_boundary_below_vdemon() {
-        assert_eq!(VelocityTier::from_commits_per_min(3.99), VelocityTier::Demon);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(3.99),
+            VelocityTier::Demon
+        );
     }
 
     #[test]
     fn test_tier_high_cpm() {
-        assert_eq!(VelocityTier::from_commits_per_min(100.0), VelocityTier::VelocityDemon);
+        assert_eq!(
+            VelocityTier::from_commits_per_min(100.0),
+            VelocityTier::VelocityDemon
+        );
     }
 
     // --- speed_target ---

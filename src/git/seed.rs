@@ -226,7 +226,10 @@ mod tests {
     fn test_hash_range() {
         for s in &["", "a", "hello world", "git@github.com:user/repo.git", "🦀"] {
             let hue = hash_to_hue(s);
-            assert!(hue >= 0.0 && hue < 360.0, "hue {hue} out of range for {s:?}");
+            assert!(
+                hue >= 0.0 && hue < 360.0,
+                "hue {hue} out of range for {s:?}"
+            );
         }
     }
 
